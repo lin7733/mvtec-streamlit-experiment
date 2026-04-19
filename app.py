@@ -206,7 +206,8 @@ def reset_experiment():
     for k in [
         "stage", "participant_meta", "exp_meta", "trials", "practice_trials", "current_index",
         "current_render_id", "trial_start_ts", "responses", "questionnaire", "finished",
-        "rest_done", "show_debug"
+        "rest_done", "show_debug",
+        "exp_start_ts"  # ← 加这一行
     ]:
         if k in st.session_state:
             del st.session_state[k]
@@ -370,6 +371,28 @@ def render_trial(trials: list[dict], mode: str, dataset_root: str, results_dir: 
     if mode == "formal" and idx == BREAK_AFTER and not st.session_state.get("rest_done", False):
         st.session_state["stage"] = "rest"
         st.rerun()
+
+    # ── 顶部总用时计时器 ──────────────────────────────
+    if "exp_start_ts" not in st.session_state:
+        st.session_state["exp_start_ts"] = time.time()
+
+    elapsed = int(time.time() - st.session_state["exp_start_ts"])
+    elapsed_min = elapsed // 60
+    elapsed_sec = elapsed % 60
+
+    # 预估总时长（48题×平均30秒）
+    ESTIMATED_TOTAL = 48 * 30
+    progress_ratio = min(elapsed / ESTIMATED_TOTAL, 1.0)
+
+    st.markdown(f"""
+    <div style="text-align:center; font-size:1.1rem; margin-bottom:4px;">
+        ⏱️ 实验总用时：<b>{elapsed_min:02d}:{elapsed_sec:02d}</b>
+        &nbsp;&nbsp;|&nbsp;&nbsp;预估进度：{int(progress_ratio * 100)}%
+    </div>
+    """, unsafe_allow_html=True)
+    st.progress(progress_ratio, text="")
+    st.markdown("---")
+    # ─────────────────────────────────────────────────
 
     st.progress(idx / total, text=f"{'练习题' if mode == 'practice' else '正式实验'}进度：{idx}/{total}")
     st.subheader(f"{'练习题' if mode == 'practice' else '正式题'} {idx + 1} / {total}")
