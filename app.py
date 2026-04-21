@@ -67,22 +67,18 @@ def resolve_image_path(raw_path: str, dataset_root: str) -> Path:
         raise FileNotFoundError("题库中未提供图片路径。")
 
     raw_path_norm = str(raw_path).replace("\\", "/")
-    root = Path(dataset_root)  # 部署后这里是 Path("00_raw")
+    root = Path(dataset_root)
 
-    # 1. 先试直接路径（本地绝对路径，部署后不会命中）
     direct_path = Path(raw_path)
     if direct_path.exists():
         return direct_path
 
-    # 2. 从绝对路径中提取 00_raw 之后的部分（核心逻辑，不变）
     if "00_raw/" in raw_path_norm:
         rel = raw_path_norm.split("00_raw/", 1)[1]
-        # root = Path("00_raw") 时，root.name == "00_raw"，走第一个分支
         candidate = root / Path(rel) if root.name == "00_raw" else root / "00_raw" / Path(rel)
         if candidate.exists():
             return candidate
 
-    # 3. 兜底：按类别名截取（不变）
     parts = raw_path_norm.split("/")
     for key in ["bottle", "capsule", "metal_nut"]:
         if key in parts:
@@ -92,7 +88,9 @@ def resolve_image_path(raw_path: str, dataset_root: str) -> Path:
             if candidate.exists():
                 return candidate
 
-    raise FileNotFoundError(f"无法解析图片路径：{raw_path}")
+    raise FileNotFoundError(
+        f"无法解析图片路径：{raw_path}\n请确认 sidebar 中的数据根目录设置为 MVTec_AD_Thesis 或其下的 00_raw。"
+    )
 
 
 def ensure_results_dir(base_dir: str, participant_id: str) -> Path:
@@ -196,6 +194,10 @@ def init_session():
         "finished": False,
         "rest_done": False,
         "show_debug": False,
+        "exp_start_ts": None,
+        "trial_phase": "initial",   # "initial" 看不到AI | "final" 看到AI后最终决策
+        "initial_decision": None,   # 第一阶段的判断
+        "initial_rt_ms": None,      # 第一阶段反应时
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -206,8 +208,7 @@ def reset_experiment():
     for k in [
         "stage", "participant_meta", "exp_meta", "trials", "practice_trials", "current_index",
         "current_render_id", "trial_start_ts", "responses", "questionnaire", "finished",
-        "rest_done", "show_debug",
-        "exp_start_ts"  # ← 加这一行
+        "rest_done", "show_debug", "exp_start_ts", "trial_phase", "initial_decision", "initial_rt_ms"
     ]:
         if k in st.session_state:
             del st.session_state[k]
@@ -238,8 +239,8 @@ def render_setup(df: pd.DataFrame):
             participant_id = st.text_input("被试编号", placeholder="例如：P001")
             age = st.text_input("年龄（可选）")
         with c2:
-            gender = st.selectbox("性别（可选）", ["", "女", "男", "其他/不便透露"])
-            major = st.text_input("专业（可选）")
+            gender = st.selectbox("性别", ["", "女", "男"])
+            major = st.text_input("专业")
         with c3:
             exp_name = st.selectbox("实验类型", ["实验一：有无解释", "实验二：解释形式"])
             exp1_manual = st.selectbox("实验一条件（可手动指定）", ["自动分配", "无解释", "有解释"])
@@ -252,6 +253,12 @@ def render_setup(df: pd.DataFrame):
             return
         if not participant_id:
             st.error("请先输入被试编号。")
+            return
+        if not gender:
+            st.error("请选择性别。")
+            return
+        if not major.strip():
+            st.error("请填写专业。")
             return
 
         st.session_state["participant_meta"] = {
@@ -360,6 +367,7 @@ def render_trial(trials: list[dict], mode: str, dataset_root: str, results_dir: 
         st.session_state["current_index"] = 0
         st.session_state["stage"] = "formal" if mode == "practice" else "questionnaire"
         st.session_state["current_render_id"] = None
+        st.session_state["trial_phase"] = "initial"
         st.rerun()
 
     trial = trials[idx]
@@ -367,40 +375,34 @@ def render_trial(trials: list[dict], mode: str, dataset_root: str, results_dir: 
     if st.session_state["current_render_id"] != render_uid:
         st.session_state["current_render_id"] = render_uid
         st.session_state["trial_start_ts"] = time.time()
+        st.session_state["trial_phase"] = "initial"
+        st.session_state["initial_decision"] = None
+        st.session_state["initial_rt_ms"] = None
 
     if mode == "formal" and idx == BREAK_AFTER and not st.session_state.get("rest_done", False):
         st.session_state["stage"] = "rest"
         st.rerun()
 
-    # ── 顶部总用时计时器 ──────────────────────────────
-    if "exp_start_ts" not in st.session_state:
-        st.session_state["exp_start_ts"] = time.time()
-
-    elapsed = int(time.time() - st.session_state["exp_start_ts"])
-    elapsed_min = elapsed // 60
-    elapsed_sec = elapsed % 60
-
-    # 预估总时长（48题×平均30秒）
-    ESTIMATED_TOTAL = 48 * 30
-    progress_ratio = min(elapsed / ESTIMATED_TOTAL, 1.0)
-
-    st.markdown(f"""
-    <div style="text-align:center; font-size:1.1rem; margin-bottom:4px;">
-        ⏱️ 实验总用时：<b>{elapsed_min:02d}:{elapsed_sec:02d}</b>
-        &nbsp;&nbsp;|&nbsp;&nbsp;预估进度：{int(progress_ratio * 100)}%
-    </div>
-    """, unsafe_allow_html=True)
-    st.progress(progress_ratio, text="")
-    st.markdown("---")
-    # ─────────────────────────────────────────────────
+    # ── 顶部总用时计时器 ──
+    if mode == "formal":
+        if not st.session_state.get("exp_start_ts"):
+            st.session_state["exp_start_ts"] = time.time()
+        elapsed = int(time.time() - st.session_state["exp_start_ts"])
+        elapsed_min, elapsed_sec = elapsed // 60, elapsed % 60
+        ESTIMATED_TOTAL = 48 * 30
+        progress_ratio = min(elapsed / ESTIMATED_TOTAL, 1.0)
+        st.markdown(f"<div style='text-align:center;font-size:1rem;margin-bottom:4px;'>⏱️ 实验总用时：<b>{elapsed_min:02d}:{elapsed_sec:02d}</b>&nbsp;&nbsp;|&nbsp;&nbsp;预估进度：{int(progress_ratio*100)}%</div>", unsafe_allow_html=True)
+        st.progress(progress_ratio, text="")
 
     st.progress(idx / total, text=f"{'练习题' if mode == 'practice' else '正式实验'}进度：{idx}/{total}")
     st.subheader(f"{'练习题' if mode == 'practice' else '正式题'} {idx + 1} / {total}")
 
+    phase = st.session_state.get("trial_phase", "initial")
+
     c1, c2 = st.columns([1.15, 1.0])
     with c1:
         if show_debug:
-            st.caption(f"题号：{trial['trial_id']}｜图片ID：{trial['item_id']}｜类别：{trial['category']}｜复杂度：{trial['complexity']}")
+            st.caption(f"题号：{trial['trial_id']}｜图片ID：{trial['item_id']}｜类别：{trial['category']}｜复杂度：{trial['complexity']}｜阶段：{phase}")
         try:
             img_path = resolve_image_path(trial["image_path"], dataset_root)
             st.image(Image.open(img_path), use_container_width=True)
@@ -410,56 +412,83 @@ def render_trial(trials: list[dict], mode: str, dataset_root: str, results_dir: 
             st.error(f"图片读取失败：{e}")
 
     with c2:
-        st.markdown("### AI 输出")
-        st.info(f"AI 判定：**{trial['ai_suggestion']}**")
-        if trial["explanation_mode"] == "无解释":
-            st.write("本条件下不提供额外解释信息。")
+        if phase == "initial":
+            # ── 第一阶段：只看图，不显示AI建议 ──
+            st.markdown("### 第一步：请先根据图像独立判断")
+            st.info("请仔细观察图像，在看到 AI 建议之前，先给出你的初步判断。")
+            st.markdown("---")
+            st.markdown("### 你的初步判断")
+            c_ok, c_ng = st.columns(2)
+
+            def submit_initial(decision: str):
+                rt_ms = int((time.time() - st.session_state["trial_start_ts"]) * 1000)
+                st.session_state["initial_decision"] = decision
+                st.session_state["initial_rt_ms"] = rt_ms
+                st.session_state["trial_phase"] = "final"
+                st.session_state["trial_start_ts"] = time.time()  # 重置计时，记录第二阶段RT
+                st.rerun()
+
+            with c_ok:
+                if st.button("判定为 OK（合格）", key=f"init_ok_{render_uid}", use_container_width=True):
+                    submit_initial("OK（合格）")
+            with c_ng:
+                if st.button("判定为 NG（不合格）", key=f"init_ng_{render_uid}", use_container_width=True):
+                    submit_initial("NG（不合格）")
+            st.caption("练习题不计入正式数据。" if mode == "practice" else "请基于图像独立判断，完成后将显示 AI 建议。")
+
         else:
-            if show_debug:
-                st.caption(f"当前解释模式：{trial['explanation_mode']}")
-            st.write(trial["explanation_text"])
+            # ── 第二阶段：显示AI建议，做最终决策 ──
+            st.markdown("### 第二步：参考 AI 建议，做出最终判断")
+            st.info(f"AI 判定：**{trial['ai_suggestion']}**")
+            if trial["explanation_mode"] != "无解释":
+                if show_debug:
+                    st.caption(f"当前解释模式：{trial['explanation_mode']}")
+                st.write(trial["explanation_text"])
+            st.caption(f"你的初步判断：**{st.session_state['initial_decision']}**")
+            st.markdown("---")
+            st.markdown("### 你的最终判断")
+            c_ok, c_ng = st.columns(2)
 
-        st.markdown("---")
-        st.markdown("### 你的判断")
-        c_ok, c_ng = st.columns(2)
+            def submit_final(decision: str):
+                rt_ms = int((time.time() - st.session_state["trial_start_ts"]) * 1000)
+                record = {
+                    "participant_id": st.session_state["participant_meta"].get("participant_id", ""),
+                    "exp_name": trial["exp_name"],
+                    "trial_stage": mode,
+                    "trial_index": idx + 1,
+                    "trial_id": trial["trial_id"],
+                    "item_id": trial["item_id"],
+                    "category": trial["category"],
+                    "defect_type": trial["defect_type"],
+                    "complexity": trial["complexity"],
+                    "true_label": trial["true_label"],
+                    "ai_suggestion": trial["ai_suggestion"],
+                    "ai_correct": trial["ai_correct"],
+                    "explanation_mode": trial["explanation_mode"],
+                    "initial_decision": st.session_state["initial_decision"],
+                    "initial_rt_ms": st.session_state["initial_rt_ms"],
+                    "final_decision": decision,
+                    "final_rt_ms": rt_ms,
+                    "decision_changed": "是" if decision != st.session_state["initial_decision"] else "否",
+                    "adoption": calc_adoption(decision, trial["ai_suggestion"]),
+                    "dependence_type": calc_dependence(decision, trial["ai_suggestion"], trial["ai_correct"]),
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                if mode != "practice":
+                    st.session_state["responses"].append(record)
+                    save_progress(results_dir)
+                st.session_state["current_index"] += 1
+                st.session_state["current_render_id"] = None
+                st.session_state["trial_phase"] = "initial"
+                st.rerun()
 
-        def submit_response(decision: str):
-            rt_ms = int((time.time() - st.session_state["trial_start_ts"]) * 1000)
-            record = {
-                "participant_id": st.session_state["participant_meta"].get("participant_id", ""),
-                "exp_name": trial["exp_name"],
-                "trial_stage": mode,
-                "trial_index": idx + 1,
-                "trial_id": trial["trial_id"],
-                "item_id": trial["item_id"],
-                "category": trial["category"],
-                "defect_type": trial["defect_type"],
-                "complexity": trial["complexity"],
-                "true_label": trial["true_label"],
-                "ai_suggestion": trial["ai_suggestion"],
-                "ai_correct": trial["ai_correct"],
-                "explanation_mode": trial["explanation_mode"],
-                "decision": decision,
-                "adoption": calc_adoption(decision, trial["ai_suggestion"]),
-                "dependence_type": calc_dependence(decision, trial["ai_suggestion"], trial["ai_correct"]),
-                "rt_ms": rt_ms,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
-            if mode != "practice":
-                st.session_state["responses"].append(record)
-                save_progress(results_dir)
-            st.session_state["current_index"] += 1
-            st.session_state["current_render_id"] = None
-            st.rerun()
-
-        with c_ok:
-            if st.button("判定为 OK（合格）", key=f"ok_{render_uid}", use_container_width=True):
-                submit_response("OK（合格）")
-        with c_ng:
-            if st.button("判定为 NG（不合格）", key=f"ng_{render_uid}", use_container_width=True):
-                submit_response("NG（不合格）")
-
-        st.caption("练习题不计入正式数据。" if mode == "practice" else "请尽量快速且认真地作答。点击按钮后将自动进入下一题。")
+            with c_ok:
+                if st.button("最终判定为 OK（合格）", key=f"final_ok_{render_uid}", use_container_width=True):
+                    submit_final("OK（合格）")
+            with c_ng:
+                if st.button("最终判定为 NG（不合格）", key=f"final_ng_{render_uid}", use_container_width=True):
+                    submit_final("NG（不合格）")
+            st.caption("练习题不计入正式数据。" if mode == "practice" else "可与初步判断相同或不同，请综合图像与 AI 建议作出最终决定。")
 
 
 def render_questionnaire(results_dir: str):
@@ -493,59 +522,64 @@ def render_questionnaire(results_dir: str):
 
 
 def render_finish(results_dir: str):
-    st.title("实验完成 🎉")
-    st.success("感谢参与！请下载并发送你的数据文件给研究者。")
-
-    responses = pd.DataFrame(st.session_state["responses"])
+    st.title("实验完成")
+    st.success("感谢参与！数据已保存。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
-
+    out_dir = ensure_results_dir(results_dir, participant_id)
+    responses = pd.DataFrame(st.session_state["responses"])
     if not responses.empty:
-        # 显示简要统计（原有代码保留）
-        ...
-
-        # ✅ 关键：让被试自己下载数据
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                "⬇️ 下载实验数据（请发给研究者）",
-                data=responses.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"{participant_id}_trials.csv",
-                mime="text/csv",
-                use_container_width=True,
-                type="primary",
-            )
-        with col2:
-            q = st.session_state.get("questionnaire", {})
-            if q:
-                st.download_button(
-                    "⬇️ 下载问卷数据",
-                    data=pd.DataFrame([q]).to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"{participant_id}_questionnaire.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-    if st.button("开始下一位被试", use_container_width=True):
-        reset_experiment()
-        st.rerun()
+        summary = {
+            "总题数": len(responses),
+            "平均反应时(ms)": round(responses["rt_ms"].mean(), 1),
+            "采纳AI比例": f"{(responses['adoption'].eq('采纳').mean() * 100):.1f}%",
+            "适当依赖率": f"{(responses['dependence_type'].eq('适当依赖').mean() * 100):.1f}%",
+            "过度依赖率": f"{(responses['dependence_type'].eq('过度依赖').mean() * 100):.1f}%",
+            "依赖不足率": f"{(responses['dependence_type'].eq('依赖不足').mean() * 100):.1f}%",
+        }
+        st.markdown("### 本次实验简要统计")
+        st.dataframe(pd.DataFrame([summary]), hide_index=True, use_container_width=True)
+        st.markdown("### 文件位置")
+        st.code(str(out_dir), language="text")
+        st.download_button(
+            "下载本次 trial 数据 CSV",
+            data=responses.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{participant_id}_trial_responses.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🏠 返回首页（下一位被试）", use_container_width=True, type="primary"):
+            reset_experiment()
+            st.rerun()
+    with c2:
+        if st.button("重新开始本位被试", use_container_width=True):
+            pid = st.session_state["participant_meta"].get("participant_id", "")
+            reset_experiment()
+            st.session_state["stage"] = "setup"
+            st.rerun()
 
 
 def render_sidebar():
     st.sidebar.title("实验设置")
     uploaded_file = st.sidebar.file_uploader("上传修订版题库 xlsx", type=["xlsx"])
-
-    # ❌ 原来：让用户手动输入路径
-    # workbook_path = st.sidebar.text_input("或填写本地题库路径", value="")
-    # dataset_root = st.sidebar.text_input("图片根目录（MVTec_AD_Thesis 或 00_raw）", value="")
-
-    # ✅ 改为：硬编码相对路径（部署后固定不变）
-    workbook_path = "05_metadata/MVTec_实验题库_完整版_解释优化版.xlsx"
-    dataset_root = "00_raw"  # 相对于 app.py 的位置
-
-    results_dir = RESULTS_DIR_DEFAULT  # "results"，直接用默认值
-
-    # 调试开关仅管理员需要，可保留
-    st.session_state["show_debug"] = False  # 部署后关闭调试
-    ...
+    workbook_path = st.sidebar.text_input("或填写本地题库路径", value="")
+    dataset_root = st.sidebar.text_input(
+        "图片根目录（MVTec_AD_Thesis 或 00_raw）",
+        value="",
+        help="例如：D:/.../MVTec_AD_Thesis 或 D:/.../MVTec_AD_Thesis/00_raw",
+    )
+    results_dir = st.sidebar.text_input("结果保存目录", value=RESULTS_DIR_DEFAULT)
+    st.sidebar.markdown("---")
+    st.session_state["show_debug"] = st.sidebar.checkbox("显示调试信息（题号/图片ID/路径/解释模式）", value=False)
+    if st.session_state.get("exp_meta"):
+        with st.sidebar.expander("当前会话信息", expanded=False):
+            st.write(st.session_state["exp_meta"])
+            st.write(st.session_state["participant_meta"])
+    st.sidebar.caption("建议本地运行 Streamlit，以便直接读取你的图片路径。")
+    if st.sidebar.button("重置当前会话"):
+        reset_experiment()
+        st.rerun()
     return uploaded_file, workbook_path, dataset_root, results_dir
 
 
