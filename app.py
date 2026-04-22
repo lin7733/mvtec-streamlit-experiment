@@ -1,14 +1,15 @@
 import hashlib
 import json
-import os
 import random
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageFile
 import streamlit as st
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 st.set_page_config(
     page_title="MVTec AD 解释透明度实验",
@@ -23,24 +24,24 @@ DATASET_ROOT = "00_raw"
 RESULTS_DIR_DEFAULT = "results"
 PRACTICE_TRIALS = 4
 BREAK_AFTER = 24
+OUTPUT_XLSX_NAME = "experiment_data.xlsx"
 
 CONSENT_TEXT = """
 **知情同意书**
 
-本实验为本科毕业论文研究项目，研究主题为"AI 解释透明度对人机协作决策的影响"。
+本实验为本科毕业论文研究项目，研究主题为“AI 解释透明度对人机协作决策的影响”。
 
-**实验内容：** 你将完成一系列工业产品质检判断任务，并在实验前后填写相关问卷。
+**实验内容：** 你将完成一系列工业产品质检判断任务，并在实验结束后填写问卷。
 
-**数据使用：** 实验过程中记录的所有数据（作答结果、反应时间、问卷评分）仅用于学术研究分析，不会涉及个人隐私信息的泄露。
+**数据使用：** 实验过程中记录的作答结果、反应时间和问卷评分，仅用于学术研究分析。
 
-**自愿参与：** 你可以在任何时候选择退出实验，不会有任何不良后果。
+**自愿参与：** 你可以在任何时候选择退出实验，不会产生任何不良后果。
 
 **实验时长：** 约 20–30 分钟。
 
 请确认你已充分理解以上内容，并自愿参与本实验。
 """
 
-# 产品缺陷说明
 PRODUCT_STANDARDS = {
     "bottle": {
         "name": "瓶子（Bottle）",
@@ -49,7 +50,7 @@ PRODUCT_STANDARDS = {
             "污染（Contamination）：瓶身表面有污渍、附着物或颜色异常区域",
             "大破损（Broken Large）：瓶口、瓶身出现较大缺口或破裂",
             "小破损（Broken Small）：瓶身出现细微裂缝或小缺口",
-        ]
+        ],
     },
     "capsule": {
         "name": "胶囊（Capsule）",
@@ -59,7 +60,7 @@ PRODUCT_STANDARDS = {
             "渗漏（Squeeze）：胶囊受挤压变形或内容物外漏",
             "压痕（Poke）：胶囊表面有明显凹陷或戳痕",
             "划痕（Scratch）：胶囊表面有线状划伤痕迹",
-        ]
+        ],
     },
     "metal_nut": {
         "name": "金属螺母（Metal Nut）",
@@ -69,22 +70,31 @@ PRODUCT_STANDARDS = {
             "颜色异常（Color）：螺母表面颜色不均匀或有锈斑",
             "翻转（Flip）：螺母放置方向错误或翻面",
             "划痕（Scratch）：螺母表面有明显划伤",
-        ]
-    }
+        ],
+    },
 }
 
+REQUIRED_COLS = [
+    "题号", "图片ID", "产品类别", "缺陷类型", "复杂度", "真实标签", "AI建议", "AI是否正确",
+    "实验一-无解释呈现", "实验一-统一解释内容", "实验二-指标型解释内容", "实验二-理由型解释内容", "图片源路径"
+]
 
-# ── 工具函数 ──────────────────────────────────────────────
 
 def stable_hash_int(text: str) -> int:
     return int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
 
 
+def safe_str(v) -> str:
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [safe_str(c) for c in df.columns]
     for c in df.columns:
-        df[c] = df[c].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+        df[c] = df[c].apply(safe_str)
     return df
 
 
@@ -96,53 +106,122 @@ def read_bank() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def parse_ai_correct(v: str) -> bool:
-    return str(v).startswith("正确")
+def sanitize_for_path(text: str) -> str:
+    cleaned = "".join(ch for ch in safe_str(text) if ch.isalnum() or ch in {"_", "-"})
+    return cleaned or "unknown"
 
 
-def calc_adoption(decision: str, ai_suggestion: str) -> str:
-    return "采纳" if decision == ai_suggestion else "未采纳"
+def build_participant_id(student_id: str, exp_short: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    return f"{exp_short}_{sanitize_for_path(student_id)}_{ts}"
 
 
-def calc_dependence(decision: str, ai_suggestion: str, ai_correct: str) -> str:
-    adopted = decision == ai_suggestion
-    if parse_ai_correct(ai_correct):
-        return "适当依赖" if adopted else "依赖不足"
-    return "过度依赖" if adopted else "适当依赖"
+def normalize_label(value: str) -> str:
+    text = safe_str(value).lower().replace("（", "(").replace("）", ")")
+    if any(k in text for k in ["ok", "合格", "正常", "good", "no defect", "无缺陷"]):
+        return "OK"
+    if any(k in text for k in ["ng", "不合格", "异常", "缺陷", "bad", "defect", "有缺陷"]):
+        return "NG"
+    return safe_str(value)
+
+
+def normalize_complexity(value: str) -> str:
+    text = safe_str(value).lower()
+    if any(k in text for k in ["low", "低"]):
+        return "low"
+    if any(k in text for k in ["high", "高"]):
+        return "high"
+    return safe_str(value)
+
+
+def normalize_category(value: str) -> str:
+    text = safe_str(value).lower()
+    mapping = {
+        "bottle": "bottle",
+        "capsule": "capsule",
+        "metal_nut": "metal_nut",
+        "瓶": "bottle",
+        "胶囊": "capsule",
+        "螺母": "metal_nut",
+    }
+    for key, val in mapping.items():
+        if key in text:
+            return val
+    return safe_str(value)
+
+
+def parse_ai_correct(value: str, ai_suggestion: str = "", true_label: str = "") -> int:
+    text = safe_str(value).lower()
+    if any(k in text for k in ["正确", "true", "yes", "是", "1"]):
+        return 1
+    if any(k in text for k in ["错误", "false", "no", "否", "0"]):
+        return 0
+    return int(normalize_label(ai_suggestion) == normalize_label(true_label))
+
+
+def calc_adoption(final_decision: str, ai_suggestion: str) -> int:
+    return int(normalize_label(final_decision) == normalize_label(ai_suggestion))
+
+
+def calc_dependence_code(final_decision: str, ai_suggestion: str, ai_correct: str, true_label: str) -> str:
+    adopted = normalize_label(final_decision) == normalize_label(ai_suggestion)
+    ai_is_correct = parse_ai_correct(ai_correct, ai_suggestion, true_label) == 1
+    if ai_is_correct:
+        return "proper" if adopted else "under"
+    return "over" if adopted else "proper"
+
+
+def decision_is_correct(decision: str, true_label: str) -> int:
+    return int(normalize_label(decision) == normalize_label(true_label))
 
 
 def resolve_image_path(raw_path: str) -> Path:
     if not raw_path:
         raise FileNotFoundError("题库中未提供图片路径。")
 
-    raw_norm = str(raw_path).replace("\\", "/")
+    raw_norm = safe_str(raw_path).replace("\\", "/")
     root = Path(DATASET_ROOT)
+    direct = Path(raw_norm)
+    candidates = []
 
-    # 策略1：直接路径（本地调试用）
-    direct = Path(raw_path)
-    if direct.exists():
-        return direct
+    def add_candidate(p: Path):
+        if p not in candidates:
+            candidates.append(p)
 
-    # 策略2：从 00_raw/ 截取相对路径
+    add_candidate(direct)
+    add_candidate(root / raw_norm)
+
     if "00_raw/" in raw_norm:
         rel = raw_norm.split("00_raw/", 1)[1]
-        candidate = root / Path(rel)
-        if candidate.exists():
-            return candidate
+        add_candidate(root / rel)
 
-    # 策略3：从产品类别名截取
-    parts = raw_norm.split("/")
+    parts = [p for p in raw_norm.split("/") if p]
     for key in ["bottle", "capsule", "metal_nut"]:
         if key in parts:
             idx = parts.index(key)
-            rel = Path(*parts[idx:])
-            candidate = root / rel
-            if candidate.exists():
-                return candidate
+            add_candidate(root / Path(*parts[idx:]))
+            break
+
+    for p in candidates:
+        if p.exists() and p.is_file():
+            return p
+
+    filename = Path(raw_norm).name
+    if filename and root.exists():
+        matches = list(root.rglob(filename))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raw_lower = raw_norm.lower()
+            for m in matches:
+                m_str = str(m).replace("\\", "/").lower()
+                if all(seg.lower() in m_str for seg in parts[-3:]):
+                    return m
+            return matches[0]
 
     raise FileNotFoundError(
-        f"图片未找到：{raw_path}\n"
-        f"请确认 00_raw/ 下包含对应子文件夹（含 good/ 文件夹）。"
+        f"图片未找到：{raw_path}。\n"
+        f"请检查图片源路径是否为旧设备绝对路径，或当前 00_raw 目录是否与题库对应。"
     )
 
 
@@ -157,22 +236,44 @@ def save_json(path: Path, payload: dict):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def save_csv(path: Path, rows: list):
-    if rows:
-        pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+def get_condition_from_participant(participant_key: str, options: list) -> str:
+    return options[stable_hash_int(participant_key) % len(options)]
 
 
-def get_condition_from_participant(participant_id: str, options: list) -> str:
-    return options[stable_hash_int(participant_id) % len(options)]
+def map_strategy_code(text: str) -> str:
+    mapping = {
+        "主要依靠自己的图像判断": "self",
+        "图像判断和AI建议各参考一半": "half",
+        "主要参考AI建议": "ai",
+        "视情况而定": "depends",
+    }
+    return mapping.get(text, safe_str(text))
 
 
-# ── 题目构建 ──────────────────────────────────────────────
+def map_changed_reason_code(text: str) -> str:
+    mapping = {
+        "AI建议与我不同，选择相信AI": "trust_ai",
+        "AI的解释让我重新审视图像": "recheck_image",
+        "不确定时偏向跟随AI": "uncertain_follow_ai",
+        "我没有改变过判断": "no_change",
+    }
+    return mapping.get(text, safe_str(text))
 
-def build_exp1_trials(df: pd.DataFrame, participant_id: str, manual_condition=None):
-    condition = manual_condition or get_condition_from_participant(participant_id, ["无解释", "有解释"])
+
+def map_exp2_choice_code(text: str) -> str:
+    mapping = {
+        "指标型解释（数字/百分比）": "metric",
+        "理由型解释（文字描述）": "reason",
+        "两者差不多": "same",
+    }
+    return mapping.get(text, safe_str(text))
+
+
+def build_exp1_trials(df: pd.DataFrame, participant_key: str):
+    condition = get_condition_from_participant(participant_key, ["无解释", "有解释"])
     trials = []
     for _, row in df.iterrows():
-        explanation_text = row["实验一-无解释呈现"] if condition == "无解释" else row["实验一-统一解释内容"]
+        explanation_text = "" if condition == "无解释" else row["实验一-统一解释内容"]
         trials.append({
             "trial_id": row["题号"],
             "item_id": row["图片ID"],
@@ -187,13 +288,13 @@ def build_exp1_trials(df: pd.DataFrame, participant_id: str, manual_condition=No
             "explanation_text": explanation_text,
             "exp_name": "实验一",
         })
-    rnd = random.Random(stable_hash_int(participant_id + "_exp1_order"))
+    rnd = random.Random(stable_hash_int(participant_key + "_exp1_order"))
     rnd.shuffle(trials)
-    return trials, {"exp_name": "实验一", "condition": condition, "design": "组间"}
+    return trials, {"exp_name": "实验一", "design": "between", "condition": condition}
 
 
-def build_exp2_trials(df: pd.DataFrame, participant_id: str):
-    version = "A" if stable_hash_int(participant_id) % 2 == 0 else "B"
+def build_exp2_trials(df: pd.DataFrame, participant_key: str):
+    version = "A" if stable_hash_int(participant_key) % 2 == 0 else "B"
     tmp = df.copy()
     tmp["group_key"] = tmp["产品类别"] + "|" + tmp["复杂度"] + "|" + tmp["真实标签"]
     trials = []
@@ -217,16 +318,16 @@ def build_exp2_trials(df: pd.DataFrame, participant_id: str):
                 "explanation_text": row["实验二-指标型解释内容"] if is_metric else row["实验二-理由型解释内容"],
                 "exp_name": "实验二",
             })
-    rnd = random.Random(stable_hash_int(participant_id + "_exp2_order"))
+    rnd = random.Random(stable_hash_int(participant_key + "_exp2_order"))
     rnd.shuffle(trials)
-    return trials, {"exp_name": "实验二", "counterbalance_version": version, "design": "被试内"}
+    return trials, {"exp_name": "实验二", "design": "within", "counterbalance_version": version}
 
 
-def select_practice_trials(trials: list, participant_id: str, n: int):
+def select_practice_trials(trials: list, participant_key: str, n: int):
     if n <= 0:
         return []
-    rnd = random.Random(stable_hash_int(participant_id + "_practice"))
     copied = [t.copy() for t in trials]
+    rnd = random.Random(stable_hash_int(participant_key + "_practice"))
     rnd.shuffle(copied)
     practice = copied[:min(n, len(copied))]
     for t in practice:
@@ -234,7 +335,75 @@ def select_practice_trials(trials: list, participant_id: str, n: int):
     return practice
 
 
-# ── Session 管理 ──────────────────────────────────────────
+def participant_sheet_df() -> pd.DataFrame:
+    meta = st.session_state.get("participant_meta", {})
+    exp_meta = st.session_state.get("exp_meta", {})
+    if not meta:
+        return pd.DataFrame()
+    row = {
+        "participant_id": meta.get("participant_id", ""),
+        "name": meta.get("name", ""),
+        "student_id": meta.get("student_id", ""),
+        "age": meta.get("age", ""),
+        "gender": meta.get("gender", ""),
+        "major": meta.get("major", ""),
+        "exp_type": meta.get("exp_type", ""),
+        "exp_condition": meta.get("exp_condition", ""),
+        "design": exp_meta.get("design", ""),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return pd.DataFrame([row])
+
+
+def questionnaire_sheet_df() -> pd.DataFrame:
+    q = st.session_state.get("questionnaire", {})
+    meta = st.session_state.get("participant_meta", {})
+    if not q or not meta:
+        return pd.DataFrame()
+    row = {"participant_id": meta.get("participant_id", "")}
+    row.update(q)
+    return pd.DataFrame([row])
+
+
+def trial_sheet_df() -> pd.DataFrame:
+    rows = st.session_state.get("responses", [])
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def save_progress():
+    meta = st.session_state.get("participant_meta", {})
+    if not meta:
+        return
+    out_dir = ensure_results_dir(meta.get("participant_id", "unknown"))
+    xlsx_path = out_dir / OUTPUT_XLSX_NAME
+
+    participant_df = participant_sheet_df()
+    questionnaire_df = questionnaire_sheet_df()
+    trial_df = trial_sheet_df()
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        participant_df.to_excel(writer, sheet_name="participant_info", index=False)
+        if questionnaire_df.empty:
+            pd.DataFrame(columns=["participant_id"]).to_excel(writer, sheet_name="questionnaire", index=False)
+        else:
+            questionnaire_df.to_excel(writer, sheet_name="questionnaire", index=False)
+        if trial_df.empty:
+            pd.DataFrame(columns=[
+                "participant_id", "trial_index", "trial_id", "category", "complexity", "true_label",
+                "ai_label", "initial_decision", "final_decision", "total_rt_ms"
+            ]).to_excel(writer, sheet_name="trial_data", index=False)
+        else:
+            trial_df.to_excel(writer, sheet_name="trial_data", index=False)
+
+    save_json(out_dir / "session_meta.json", {
+        "participant_meta": meta,
+        "exp_meta": st.session_state.get("exp_meta", {}),
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "xlsx_path": str(xlsx_path),
+    })
+
 
 def init_session():
     defaults = {
@@ -249,11 +418,12 @@ def init_session():
         "exp_start_ts": None,
         "responses": [],
         "questionnaire": {},
-        "finished": False,
         "rest_done": False,
         "trial_phase": "initial",
         "initial_decision": None,
         "initial_rt_ms": None,
+        "resolved_image_path": "",
+        "show_debug": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -262,10 +432,9 @@ def init_session():
 
 def reset_experiment():
     keys = [
-        "stage", "participant_meta", "exp_meta", "trials", "practice_trials",
-        "current_index", "current_render_id", "trial_start_ts", "exp_start_ts",
-        "responses", "questionnaire", "finished", "rest_done",
-        "trial_phase", "initial_decision", "initial_rt_ms",
+        "stage", "participant_meta", "exp_meta", "trials", "practice_trials", "current_index",
+        "current_render_id", "trial_start_ts", "exp_start_ts", "responses", "questionnaire",
+        "rest_done", "trial_phase", "initial_decision", "initial_rt_ms", "resolved_image_path", "show_debug"
     ]
     for k in keys:
         if k in st.session_state:
@@ -273,58 +442,40 @@ def reset_experiment():
     init_session()
 
 
-def save_progress():
-    participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
-    out_dir = ensure_results_dir(participant_id)
-    save_json(out_dir / "session_meta.json", {
-        "participant_meta": st.session_state["participant_meta"],
-        "exp_meta": st.session_state["exp_meta"],
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    save_csv(out_dir / "trial_responses.csv", st.session_state["responses"])
-    if st.session_state.get("questionnaire"):
-        save_json(out_dir / "questionnaire.json", st.session_state["questionnaire"])
-
-
-# ── 页面渲染 ──────────────────────────────────────────────
-
 def render_setup(df: pd.DataFrame):
     st.title(APP_TITLE)
-
     st.info(
         "**参与须知：** 本实验分为实验一和实验二两种类型，**每位被试只需完成其中一种**。"
-        "请根据研究者的安排选择你的实验类型，并如实填写以下基本信息。"
+        "请根据研究者安排选择实验类型，并如实填写以下基本信息。"
     )
 
     with st.form("setup_form"):
         st.markdown("#### 被试基本信息")
         c1, c2, c3 = st.columns(3)
         with c1:
-            participant_id = st.text_input("被试编号 *", placeholder="例如：P001")
-            name = st.text_input("姓名 *", placeholder="请输入真实姓名")
+            name = st.text_input("姓名 *")
+            student_id = st.text_input("学号 *")
         with c2:
-            student_id = st.text_input("学号 *", placeholder="请输入学号")
-            age = st.text_input("年龄 *", placeholder="例如：21")
-        with c3:
+            age = st.text_input("年龄 *")
             gender = st.selectbox("性别 *", ["", "女", "男"])
-            major = st.text_input("专业 *", placeholder="例如：工业工程")
-
-        st.markdown("#### 实验类型")
-        exp_name = st.selectbox(
-            "实验类型 *（请按研究者指示选择）",
-            ["实验一：有无解释", "实验二：解释形式"]
-        )
+        with c3:
+            major = st.text_input("专业 *")
+            exp_name = st.selectbox("实验类型 *", ["实验一：有无解释", "实验二：解释形式"])
 
         submitted = st.form_submit_button("确认并进入实验", use_container_width=True, type="primary")
 
     if submitted:
         errors = []
-        if not participant_id.strip(): errors.append("被试编号")
-        if not name.strip(): errors.append("姓名")
-        if not student_id.strip(): errors.append("学号")
-        if not age.strip(): errors.append("年龄")
-        if not gender: errors.append("性别")
-        if not major.strip(): errors.append("专业")
+        if not safe_str(name):
+            errors.append("姓名")
+        if not safe_str(student_id):
+            errors.append("学号")
+        if not safe_str(age):
+            errors.append("年龄")
+        if not gender:
+            errors.append("性别")
+        if not safe_str(major):
+            errors.append("专业")
         if errors:
             st.error(f"请填写以下必填项：{'、'.join(errors)}")
             return
@@ -332,29 +483,36 @@ def render_setup(df: pd.DataFrame):
             st.error("题库加载失败，请联系研究者。")
             return
 
-        pid = participant_id.strip()
-        # 条件自动分配，对被试不可见
+        exp_short = "exp1" if exp_name.startswith("实验一") else "exp2"
+        participant_id = build_participant_id(student_id, exp_short)
+        participant_key = safe_str(student_id) or participant_id
+
         if exp_name.startswith("实验一"):
-            condition = get_condition_from_participant(pid, ["无解释", "有解释"])
-            trials, meta = build_exp1_trials(df, pid, condition)
+            trials, meta = build_exp1_trials(df, participant_key)
+            exp_condition = "with_expl" if meta.get("condition") == "有解释" else "no_expl"
         else:
-            trials, meta = build_exp2_trials(df, pid)
+            trials, meta = build_exp2_trials(df, participant_key)
+            exp_condition = safe_str(meta.get("counterbalance_version", ""))
 
         st.session_state["participant_meta"] = {
-            "participant_id": pid,
-            "name": name.strip(),
-            "student_id": student_id.strip(),
-            "age": age.strip(),
+            "participant_id": participant_id,
+            "name": safe_str(name),
+            "student_id": safe_str(student_id),
+            "age": safe_str(age),
             "gender": gender,
-            "major": major.strip(),
-            "exp_type": exp_name,
-            "exp_condition": meta.get("condition", meta.get("counterbalance_version", "")),
+            "major": safe_str(major),
+            "exp_type": exp_short,
+            "exp_condition": exp_condition,
         }
         st.session_state["exp_meta"] = meta
         st.session_state["trials"] = trials
-        st.session_state["practice_trials"] = select_practice_trials(trials, pid, PRACTICE_TRIALS)
+        st.session_state["practice_trials"] = select_practice_trials(trials, participant_key, PRACTICE_TRIALS)
         st.session_state["current_index"] = 0
         st.session_state["responses"] = []
+        st.session_state["questionnaire"] = {}
+        st.session_state["rest_done"] = False
+        st.session_state["exp_start_ts"] = None
+        save_progress()
         st.session_state["stage"] = "consent"
         st.rerun()
 
@@ -362,7 +520,8 @@ def render_setup(df: pd.DataFrame):
         if not df.empty:
             st.dataframe(
                 df.groupby(["产品类别", "复杂度", "真实标签"]).size().reset_index(name="数量"),
-                hide_index=True, use_container_width=True
+                hide_index=True,
+                use_container_width=True,
             )
 
 
@@ -386,7 +545,8 @@ def render_instruction():
 
     st.markdown("---")
     st.markdown("### 一、实验任务")
-    st.markdown("""
+    st.markdown(
+        """
 你将看到一系列工业产品图像，每张图片展示的是 **瓶子、胶囊或金属螺母** 之一。
 你的任务是判断图中产品是否合格：
 
@@ -394,12 +554,12 @@ def render_instruction():
 |------|------|
 | ✅ **OK（合格）** | 产品外观无明显缺陷，可以出厂 |
 | ❌ **NG（不合格）** | 产品存在可见异常，不可出厂 |
-    """)
+        """
+    )
 
     st.markdown("---")
     st.markdown("### 二、各产品合格/不合格标准")
-
-    for key, info in PRODUCT_STANDARDS.items():
+    for _, info in PRODUCT_STANDARDS.items():
         with st.expander(f"📦 {info['name']}", expanded=True):
             st.markdown(f"**✅ 合格品：** {info['ok']}")
             st.markdown("**❌ 不合格品常见缺陷：**")
@@ -408,7 +568,8 @@ def render_instruction():
 
     st.markdown("---")
     st.markdown("### 三、每道题的作答流程")
-    st.markdown("""
+    st.markdown(
+        """
 每道题分为 **两个步骤**：
 
 **第一步 — 独立判断（看不到 AI 建议）**
@@ -417,16 +578,19 @@ def render_instruction():
 **第二步 — 参考 AI 后最终决策**
 > 完成初步判断后，系统会显示 AI 的检测结果（部分题目还会附上解释信息）。
 > 请综合图像与 AI 建议，给出你的最终判断。最终判断可与初步判断相同或不同。
-    """)
+        """
+    )
 
     st.markdown("---")
-    st.markdown("""
+    st.markdown(
+        f"""
 **⚠️ 注意事项**
-- 正式实验共 **48 题**，中途会有一次短暂休息（第 24 题后）。
-- 前 4 题为练习题，不计入正式数据。
-- 两步判断都会记录反应时间，请尽量**认真且不要过度拖延**。
-- 实验结束后请完成简短问卷。
-    """)
+- 前 **{PRACTICE_TRIALS} 题** 为练习题，不计入正式数据。
+- 正式实验共 **48 题**，中途会有一次短暂休息（第 {BREAK_AFTER} 题后）。
+- 系统会记录你的两次判断和反应时间。
+- 实验结束后请完成问卷。
+        """
+    )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -444,7 +608,7 @@ def render_instruction():
 
 def render_rest():
     st.title("请稍作休息 ☕")
-    st.markdown("你已完成前 24 题，已经完成一半了！建议休息 1–2 分钟后再继续。")
+    st.markdown("你已完成前 24 题，建议休息 1–2 分钟后再继续。")
     elapsed = int(time.time() - (st.session_state.get("exp_start_ts") or time.time()))
     st.info(f"当前已用时：{elapsed // 60} 分 {elapsed % 60} 秒")
     if st.button("我已休息好，继续实验", type="primary", use_container_width=True):
@@ -465,38 +629,36 @@ def render_trial(trials: list, mode: str):
         st.session_state["trial_phase"] = "initial"
         st.rerun()
 
+    if mode == "formal" and idx == BREAK_AFTER and not st.session_state.get("rest_done", False):
+        st.session_state["stage"] = "rest"
+        st.rerun()
+
     trial = trials[idx]
     render_uid = f"{mode}_{trial['trial_id']}_{idx}"
 
-    # 新题初始化
     if st.session_state["current_render_id"] != render_uid:
         st.session_state["current_render_id"] = render_uid
         st.session_state["trial_start_ts"] = time.time()
         st.session_state["trial_phase"] = "initial"
         st.session_state["initial_decision"] = None
         st.session_state["initial_rt_ms"] = None
+        st.session_state["resolved_image_path"] = ""
 
-    # 休息检查
-    if mode == "formal" and idx == BREAK_AFTER and not st.session_state.get("rest_done", False):
-        st.session_state["stage"] = "rest"
-        st.rerun()
-
-    # 实验开始时间
     if mode == "formal" and not st.session_state.get("exp_start_ts"):
         st.session_state["exp_start_ts"] = time.time()
 
-    # ── 顶部进度区域 ──
     if mode == "formal":
         elapsed = int(time.time() - st.session_state["exp_start_ts"])
         em, es = elapsed // 60, elapsed % 60
         st.markdown(
             f"<div style='text-align:center;padding:6px 0;font-size:0.95rem;'>"
-            f"⏱️ 已用时 <b>{em:02d}:{es:02d}</b> &nbsp;|&nbsp; 进度 <b>{idx} / {total}</b> 题</div>",
-            unsafe_allow_html=True
+            f"⏱️ 已用时 <b>{em:02d}:{es:02d}</b> &nbsp;|&nbsp; 题目进度 <b>{idx + 1} / {total}</b>"
+            f"</div>",
+            unsafe_allow_html=True,
         )
-        st.progress(idx / total)
+        st.progress((idx + 1) / total)
     else:
-        st.progress(idx / total, text=f"练习题进度：{idx}/{total}")
+        st.progress((idx + 1) / total, text=f"练习题进度：{idx + 1}/{total}")
 
     st.subheader(f"{'练习题' if mode == 'practice' else '正式题'} {idx + 1} / {total}")
 
@@ -506,15 +668,17 @@ def render_trial(trials: list, mode: str):
     with c1:
         try:
             img_path = resolve_image_path(trial["image_path"])
-            st.image(Image.open(img_path), use_container_width=True)
+            st.session_state["resolved_image_path"] = str(img_path)
+            st.image(Image.open(img_path).convert("RGB"), use_container_width=True)
+            if st.session_state.get("show_debug"):
+                st.caption(f"图片路径：{img_path}")
         except Exception as e:
             st.error(f"图片读取失败：{e}")
 
     with c2:
         if phase == "initial":
-            # ── 第一步：独立判断 ──
             st.markdown("### 第一步：请先独立判断")
-            st.info("仔细观察图像，在看到 AI 建议之前，先给出你的初步判断。")
+            st.info("请仔细观察图像，在看到 AI 建议之前，先给出你的初步判断。")
             st.markdown("---")
             st.markdown("**你的初步判断：**")
             col_ok, col_ng = st.columns(2)
@@ -528,65 +692,65 @@ def render_trial(trials: list, mode: str):
                 st.rerun()
 
             with col_ok:
-                if st.button("✅ OK（合格）", key=f"i_ok_{render_uid}", use_container_width=True):
-                    submit_initial("OK（合格）")
+                if st.button("✅ OK", key=f"i_ok_{render_uid}", use_container_width=True):
+                    submit_initial("OK")
             with col_ng:
-                if st.button("❌ NG（不合格）", key=f"i_ng_{render_uid}", use_container_width=True):
-                    submit_initial("NG（不合格）")
+                if st.button("❌ NG", key=f"i_ng_{render_uid}", use_container_width=True):
+                    submit_initial("NG")
 
             st.caption("完成初步判断后，将显示 AI 建议，再进行最终决策。" if mode != "practice" else "练习题不计入正式数据。")
 
         else:
-            # ── 第二步：参考AI后最终决策 ──
             st.markdown("### 第二步：参考 AI 建议，做最终判断")
-            st.info(f"**AI 判定：{trial['ai_suggestion']}**")
-
-            if trial["explanation_mode"] not in ("无解释", ""):
+            st.info(f"**AI 判定：{normalize_label(trial['ai_suggestion'])}**")
+            if trial["explanation_mode"] not in ("无解释", "") and safe_str(trial["explanation_text"]):
                 st.write(trial["explanation_text"])
-
             st.caption(f"你的初步判断：**{st.session_state['initial_decision']}**")
             st.markdown("---")
-            st.markdown("**你的最终判断（可与初步判断相同或不同）：**")
+            st.markdown("**你的最终判断：**")
             col_ok, col_ng = st.columns(2)
 
             def submit_final(decision: str):
                 rt = int((time.time() - st.session_state["trial_start_ts"]) * 1000)
                 init_dec = st.session_state["initial_decision"]
+                init_rt = st.session_state["initial_rt_ms"] or 0
+                meta = st.session_state["participant_meta"]
+                exp_meta = st.session_state["exp_meta"]
+
+                explanation_map = {
+                    "无解释": "none",
+                    "有解释": "unified",
+                    "指标型解释": "metric",
+                    "理由型解释": "reason",
+                }
+
                 record = {
-                    # 被试信息
-                    "participant_id": st.session_state["participant_meta"].get("participant_id", ""),
-                    "name": st.session_state["participant_meta"].get("name", ""),
-                    "student_id": st.session_state["participant_meta"].get("student_id", ""),
-                    "age": st.session_state["participant_meta"].get("age", ""),
-                    "gender": st.session_state["participant_meta"].get("gender", ""),
-                    "major": st.session_state["participant_meta"].get("major", ""),
-                    # 实验信息
-                    "exp_name": trial["exp_name"],
-                    "exp_condition": st.session_state["participant_meta"].get("exp_condition", ""),
-                    "trial_stage": mode,
+                    "participant_id": meta.get("participant_id", ""),
+                    "exp_type": meta.get("exp_type", ""),
+                    "exp_condition": meta.get("exp_condition", ""),
+                    "design": exp_meta.get("design", ""),
                     "trial_index": idx + 1,
-                    # 题目信息
                     "trial_id": trial["trial_id"],
                     "item_id": trial["item_id"],
-                    "category": trial["category"],
-                    "defect_type": trial["defect_type"],
-                    "complexity": trial["complexity"],
-                    "true_label": trial["true_label"],
-                    "ai_suggestion": trial["ai_suggestion"],
-                    "ai_correct": trial["ai_correct"],
-                    "explanation_mode": trial["explanation_mode"],
-                    # 作答数据
-                    "initial_decision": init_dec,
-                    "initial_rt_ms": st.session_state["initial_rt_ms"],
-                    "final_decision": decision,
+                    "category": normalize_category(trial["category"]),
+                    "defect_type": safe_str(trial["defect_type"]),
+                    "complexity": normalize_complexity(trial["complexity"]),
+                    "true_label": normalize_label(trial["true_label"]),
+                    "ai_label": normalize_label(trial["ai_suggestion"]),
+                    "ai_correct": parse_ai_correct(trial["ai_correct"], trial["ai_suggestion"], trial["true_label"]),
+                    "explanation_mode": explanation_map.get(trial["explanation_mode"], safe_str(trial["explanation_mode"])),
+                    "initial_decision": normalize_label(init_dec),
+                    "final_decision": normalize_label(decision),
+                    "initial_correct": decision_is_correct(init_dec, trial["true_label"]),
+                    "final_correct": decision_is_correct(decision, trial["true_label"]),
+                    "initial_rt_ms": init_rt,
                     "final_rt_ms": rt,
-                    "total_trial_rt_ms": (st.session_state["initial_rt_ms"] or 0) + rt,
-                    "decision_changed": "是" if decision != init_dec else "否",
-                    "initial_correct": "正确" if init_dec == trial["true_label"] else "错误",
-                    "final_correct": "正确" if decision == trial["true_label"] else "错误",
-                    "adoption": calc_adoption(decision, trial["ai_suggestion"]),
-                    "dependence_type": calc_dependence(decision, trial["ai_suggestion"], trial["ai_correct"]),
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "total_rt_ms": init_rt + rt,
+                    "decision_changed": int(normalize_label(decision) != normalize_label(init_dec)),
+                    "adopt_ai": calc_adoption(decision, trial["ai_suggestion"]),
+                    "dependence_type": calc_dependence_code(decision, trial["ai_suggestion"], trial["ai_correct"], trial["true_label"]),
+                    "trial_stage": mode,
+                    "recorded_at": datetime.now().isoformat(timespec="seconds"),
                 }
                 if mode != "practice":
                     st.session_state["responses"].append(record)
@@ -597,11 +761,11 @@ def render_trial(trials: list, mode: str):
                 st.rerun()
 
             with col_ok:
-                if st.button("✅ OK（合格）", key=f"f_ok_{render_uid}", use_container_width=True):
-                    submit_final("OK（合格）")
+                if st.button("✅ OK", key=f"f_ok_{render_uid}", use_container_width=True):
+                    submit_final("OK")
             with col_ng:
-                if st.button("❌ NG（不合格）", key=f"f_ng_{render_uid}", use_container_width=True):
-                    submit_final("NG（不合格）")
+                if st.button("❌ NG", key=f"f_ng_{render_uid}", use_container_width=True):
+                    submit_final("NG")
 
             st.caption("练习题不计入正式数据。" if mode == "practice" else "点击后自动进入下一题。")
 
@@ -669,12 +833,11 @@ def render_questionnaire():
                 ["指标型解释（数字/百分比）", "理由型解释（文字描述）", "两者差不多"]
             )
             extra = {
-                "easier_to_understand": easier,
-                "more_trustworthy": more_trust,
-                "more_helpful": more_helpful,
+                "easier_type": map_exp2_choice_code(easier),
+                "trust_type": map_exp2_choice_code(more_trust),
+                "helpful_type": map_exp2_choice_code(more_helpful),
             }
 
-        st.markdown("### 补充意见")
         comments = st.text_area(
             "15. 如有其他想说的（例如：哪些题目较难、对实验的建议等），请在此填写：",
             placeholder="选填"
@@ -684,7 +847,6 @@ def render_questionnaire():
 
     if submitted:
         st.session_state["questionnaire"] = {
-            "participant_id": st.session_state["participant_meta"].get("participant_id", ""),
             "understanding": understanding,
             "trust": trust,
             "reliance": reliance,
@@ -694,9 +856,9 @@ def render_questionnaire():
             "nasa_effort": nasa_effort,
             "nasa_frustration": nasa_frustration,
             "nasa_performance": nasa_performance,
-            "strategy": strategy,
-            "changed_reason": changed_reason,
-            "comments": comments.strip(),
+            "strategy": map_strategy_code(strategy),
+            "changed_reason": map_changed_reason_code(changed_reason),
+            "comments": safe_str(comments),
             **extra,
         }
         save_progress()
@@ -706,62 +868,12 @@ def render_questionnaire():
 
 def render_finish():
     st.title("🎉 实验完成")
-    st.success("感谢你的参与！请下载数据文件并发送给研究者。")
-
+    st.success("感谢你的参与，数据已自动保存。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
-    responses = pd.DataFrame(st.session_state["responses"])
+    out_dir = ensure_results_dir(participant_id)
+    st.markdown("研究者可在以下位置找到保存文件：")
+    st.code(str(out_dir / OUTPUT_XLSX_NAME), language="text")
 
-    if not responses.empty:
-        # 统计摘要
-        st.markdown("### 本次实验数据摘要")
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("完成题数", len(responses))
-        with col2:
-            init_acc = (responses["initial_correct"] == "正确").mean() * 100 if "initial_correct" in responses.columns else 0
-            st.metric("初步判断准确率", f"{init_acc:.1f}%")
-        with col3:
-            final_acc = (responses["final_correct"] == "正确").mean() * 100 if "final_correct" in responses.columns else 0
-            st.metric("最终判断准确率", f"{final_acc:.1f}%")
-        with col4:
-            changed = (responses["decision_changed"] == "是").mean() * 100 if "decision_changed" in responses.columns else 0
-            st.metric("判断改变率", f"{changed:.1f}%")
-
-        col5, col6, col7 = st.columns(3)
-        with col5:
-            adoption = (responses["adoption"] == "采纳").mean() * 100 if "adoption" in responses.columns else 0
-            st.metric("AI采纳率", f"{adoption:.1f}%")
-        with col6:
-            init_rt = responses["initial_rt_ms"].mean() if "initial_rt_ms" in responses.columns else 0
-            st.metric("初步判断平均反应时", f"{init_rt:.0f} ms")
-        with col7:
-            final_rt = responses["final_rt_ms"].mean() if "final_rt_ms" in responses.columns else 0
-            st.metric("最终判断平均反应时", f"{final_rt:.0f} ms")
-
-        st.markdown("---")
-        st.markdown("### 请下载以下数据文件并发送给研究者")
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            st.download_button(
-                "⬇️ 下载实验作答数据（CSV）",
-                data=responses.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                file_name=f"{participant_id}_trial_responses.csv",
-                mime="text/csv",
-                use_container_width=True,
-                type="primary",
-            )
-        with col_dl2:
-            q = st.session_state.get("questionnaire", {})
-            if q:
-                st.download_button(
-                    "⬇️ 下载问卷数据（CSV）",
-                    data=pd.DataFrame([q]).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-                    file_name=f"{participant_id}_questionnaire.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-
-    st.markdown("---")
     if st.button("🏠 下一位被试（返回首页）", use_container_width=True, type="primary"):
         reset_experiment()
         st.session_state["stage"] = "setup"
@@ -782,31 +894,44 @@ def render_sidebar():
             st.rerun()
 
 
-# ── 主函数 ───────────────────────────────────────────────
+def validate_ready(df: pd.DataFrame) -> bool:
+    if df.empty:
+        st.warning("尚未加载题库。")
+        return False
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        st.error(f"题库缺少必要列：{missing}")
+        return False
+    if not Path(DATASET_ROOT).exists():
+        st.warning(f"当前图片根目录不存在：{DATASET_ROOT}。如果图片不显示，请优先检查该路径。")
+    return True
+
 
 def main():
     init_session()
     render_sidebar()
-
-    df = read_bank() if st.session_state["stage"] == "setup" else read_bank()
+    df = read_bank()
     stage = st.session_state["stage"]
 
     if stage == "setup":
         render_setup(df)
-    elif stage == "consent":
-        render_consent()
-    elif stage == "instruction":
-        render_instruction()
-    elif stage == "practice":
-        render_trial(st.session_state["practice_trials"], "practice")
-    elif stage == "formal":
-        render_trial(st.session_state["trials"], "formal")
-    elif stage == "rest":
-        render_rest()
-    elif stage == "questionnaire":
-        render_questionnaire()
-    elif stage == "finish":
-        render_finish()
+    else:
+        if not validate_ready(df):
+            st.stop()
+        if stage == "consent":
+            render_consent()
+        elif stage == "instruction":
+            render_instruction()
+        elif stage == "practice":
+            render_trial(st.session_state["practice_trials"], "practice")
+        elif stage == "formal":
+            render_trial(st.session_state["trials"], "formal")
+        elif stage == "rest":
+            render_rest()
+        elif stage == "questionnaire":
+            render_questionnaire()
+        elif stage == "finish":
+            render_finish()
 
 
 if __name__ == "__main__":
