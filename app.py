@@ -246,6 +246,62 @@ def parse_ai_correct(value: str, fallback=None) -> int:
     return 1 if fallback else 0
 
 
+def product_display_name(category: str) -> str:
+    mapping = {
+        "bottle": "瓶子",
+        "capsule": "胶囊",
+        "metal_nut": "金属螺母",
+    }
+    normalized = normalize_category(category)
+    return mapping.get(normalized, safe_str(category))
+
+
+def format_numeric_range(values, decimals=0) -> str:
+    nums = []
+    for value in values:
+        try:
+            if safe_str(value) == "":
+                continue
+            nums.append(float(value))
+        except Exception:
+            continue
+    if not nums:
+        return "-"
+    fmt = f"{{:.{decimals}f}}"
+    lo, hi = min(nums), max(nums)
+    if abs(lo - hi) < 1e-9:
+        return fmt.format(lo)
+    return f"{fmt.format(lo)}-{fmt.format(hi)}"
+
+
+def build_purchase_standard_rows(trials: list) -> list:
+    grouped = {}
+    for trial in trials:
+        if trial.get("task_type") != "exp2":
+            continue
+        category = normalize_category(trial.get("category", ""))
+        grouped.setdefault(category, []).append(trial)
+
+    rows = []
+    ordered_categories = ["bottle", "capsule", "metal_nut"]
+    ordered_categories += sorted(c for c in grouped if c not in ordered_categories)
+    for category in ordered_categories:
+        subset = grouped.get(category, [])
+        if not subset:
+            continue
+        purchase_trials = [t for t in subset if to_int(t.get("true_code")) == 1]
+        rows.append(
+            {
+                "产品": product_display_name(category),
+                "质量底线": f"≥ {format_numeric_range([t.get('quality_gate') for t in subset])}",
+                "可采购样本质量分": format_numeric_range([t.get("quality_score") for t in purchase_trials]),
+                "可采购样本价格": f"{format_numeric_range([t.get('supplier_price') for t in purchase_trials], 1)} 元/件",
+                "综合门槛": f"≥ {format_numeric_range([t.get('purchase_threshold') for t in subset])}",
+            }
+        )
+    return rows
+
+
 def decision_is_correct(decision_code: int, true_code: int) -> int:
     return int(decision_code == true_code)
 
@@ -402,6 +458,8 @@ def build_exp2_trials(df: pd.DataFrame, participant_key: str):
                 "supplier_price": to_float(row.get("supplier_price")),
                 "cost_score": to_float(row.get("cost_score")),
                 "quality_gate": to_float(row.get("quality_gate")),
+                "quality_weight": to_float(row.get("quality_weight")),
+                "cost_weight": to_float(row.get("cost_weight")),
                 "weighted_score": to_float(row.get("weighted_score")),
                 "purchase_threshold": to_float(row.get("purchase_threshold")),
                 "true_label": normalize_purchase_label(row.get("purchase_gt_label")),
@@ -423,8 +481,13 @@ def build_exp2_trials(df: pd.DataFrame, participant_key: str):
     return trials, {"exp_name": "实验二", "design": "single_task", "condition": "multi_objective_purchase"}
 
 
-def build_practice_trials(practice_df: pd.DataFrame, exp_name: str):
+def build_practice_trials(practice_df: pd.DataFrame, exp_name: str, exp2_df: pd.DataFrame = None):
     filtered = practice_df[practice_df["适用实验"] == exp_name].copy().reset_index(drop=True)
+    exp2_lookup = {}
+    if exp2_df is not None and not exp2_df.empty:
+        for _, exp2_row in exp2_df.iterrows():
+            exp2_lookup[safe_str(exp2_row.get("题号"))] = exp2_row
+
     trials = []
     for _, row in filtered.iterrows():
         task_type = "exp1" if exp_name == "实验一" else "exp2"
@@ -456,37 +519,53 @@ def build_practice_trials(practice_df: pd.DataFrame, exp_name: str):
             )
         else:
             feedback_text = safe_str(row.get("反馈文本"))
+            source_row = exp2_lookup.get(safe_str(row.get("题号映射")))
+
+            def exp2_value(exp2_column: str, practice_column: str = None):
+                if source_row is not None:
+                    value = source_row.get(exp2_column)
+                    if safe_str(value) != "":
+                        return value
+                if practice_column:
+                    return row.get(practice_column)
+                return ""
+
+            true_label_value = exp2_value("purchase_gt_label", "标准答案")
+            ai_label_value = exp2_value("ai_suggestion_label", "AI建议")
             trials.append(
                 {
                     "task_type": "exp2",
                     "trial_id": safe_str(row.get("练习题号")),
                     "item_id": safe_str(row.get("图片ID")),
-                    "category": safe_str(row.get("产品类别")),
-                    "defect_type": safe_str(row.get("缺陷类型")),
-                    "complexity": safe_str(row.get("复杂度")),
+                    "category": safe_str(exp2_value("产品类别", "产品类别")),
+                    "defect_type": safe_str(exp2_value("缺陷类型", "缺陷类型")),
+                    "complexity": safe_str(exp2_value("复杂度代码", "复杂度") or exp2_value("复杂度", "复杂度")),
                     "image_path": safe_str(row.get("图片源路径")),
-                    "quality_score": 0.0,
-                    "supplier_price": 0.0,
-                    "cost_score": 0.0,
-                    "quality_gate": 0.0,
-                    "weighted_score": 0.0,
-                    "purchase_threshold": 0.0,
-                    "true_label": normalize_purchase_label(row.get("标准答案")),
-                    "true_code": to_int(row.get("标准答案代码"), purchase_code(row.get("标准答案"))),
-                    "ai_label": normalize_purchase_label(row.get("AI建议")),
-                    "ai_code": to_int(row.get("AI建议代码"), purchase_code(row.get("AI建议"))),
-                    "ai_correct": int(
-                        to_int(row.get("AI建议代码"), purchase_code(row.get("AI建议")))
-                        == to_int(row.get("标准答案代码"), purchase_code(row.get("标准答案")))
+                    "quality_score": to_float(exp2_value("quality_score")),
+                    "supplier_price": to_float(exp2_value("supplier_price")),
+                    "cost_score": to_float(exp2_value("cost_score")),
+                    "quality_gate": to_float(exp2_value("quality_gate")),
+                    "quality_weight": to_float(exp2_value("quality_weight")),
+                    "cost_weight": to_float(exp2_value("cost_weight")),
+                    "weighted_score": to_float(exp2_value("weighted_score")),
+                    "purchase_threshold": to_float(exp2_value("purchase_threshold")),
+                    "true_label": normalize_purchase_label(true_label_value),
+                    "true_code": to_int(exp2_value("purchase_gt_code", "标准答案代码"), purchase_code(true_label_value)),
+                    "ai_label": normalize_purchase_label(ai_label_value),
+                    "ai_code": to_int(exp2_value("ai_suggestion_code", "AI建议代码"), purchase_code(ai_label_value)),
+                    "ai_correct": to_int(
+                        exp2_value("ai_correct_code"),
+                        int(purchase_code(ai_label_value) == purchase_code(true_label_value)),
                     ),
-                    "decision_zone": "",
-                    "suggestion_type": "",
+                    "decision_zone": safe_str(exp2_value("decision_zone")),
+                    "suggestion_type": safe_str(exp2_value("suggestion_type")),
                     "explanation_mode": "reason",
-                    "explanation_text": "",
+                    "explanation_text": safe_str(exp2_value("实验二-理由型解释内容")),
                     "exp_name": "实验二",
                     "ui_decision_labels": ("采购", "不采购"),
                     "feedback_text": feedback_text,
                     "practice_task_type": safe_str(row.get("任务类型")),
+                    "practice_source_trial_id": safe_str(row.get("题号映射")),
                     "is_practice": True,
                 }
             )
@@ -661,7 +740,7 @@ def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.D
                 st.error("实验二题库未成功加载。")
                 return
             trials, meta = build_exp2_trials(exp2_df, participant_key)
-            practice_trials = build_practice_trials(practice_df, "实验二")
+            practice_trials = build_practice_trials(practice_df, "实验二", exp2_df)
             exp_condition = meta.get("condition", "")
 
         st.session_state["participant_meta"] = {
@@ -781,15 +860,19 @@ def render_instruction():
         )
 
         st.markdown("---")
-        st.markdown("### 二、判断原则")
+        st.markdown("### 二、采购判断标准")
         st.markdown(
             """
-- 请先关注产品质量是否达到基本要求。
-- 若质量明显偏低，即使价格较低，也未必值得采购。
-- 若质量基本达标，再综合考虑成本信息做出采购判断。
-- 系统不会告诉你后台如何计算综合判断，请根据页面提供的信息独立决策。
+- 质量分越高越好，供应价格越低越好。
+- 质量分低于基本门槛时，即使价格较低，也不建议采购。
+- 质量达标后，再综合考虑成本条件；本题库中质量权重为 70%，成本权重为 30%。
+- 综合分达到采购门槛时，标准答案为“采购”；否则为“不采购”。
             """
         )
+        standard_rows = build_purchase_standard_rows(st.session_state.get("trials", []))
+        if standard_rows:
+            st.table(pd.DataFrame(standard_rows))
+            st.caption("表中“可采购样本质量分/价格”为当前题库里标准答案为“采购”的参考范围，用于帮助理解判断标准。")
 
         st.markdown("---")
         st.markdown("### 三、每道题的作答流程")
@@ -845,8 +928,10 @@ def render_rest():
 
 def render_exp2_info(trial: dict, mode: str):
     st.markdown("### 当前产品信息")
-    quality_score = trial.get("quality_score", 0)
-    supplier_price = trial.get("supplier_price", 0)
+    quality_score = to_float(trial.get("quality_score", 0))
+    supplier_price = to_float(trial.get("supplier_price", 0))
+    quality_gate = to_float(trial.get("quality_gate", 0))
+    purchase_threshold = to_float(trial.get("purchase_threshold", 0))
     if mode == "practice" and quality_score == 0 and supplier_price == 0:
         st.info("本题为练习题，请结合图像与页面信息练习“采购 / 不采购”判断。")
     else:
@@ -855,6 +940,10 @@ def render_exp2_info(trial: dict, mode: str):
             st.metric("质量分", f"{quality_score:.0f}")
         with c2:
             st.metric("供应价格", f"{supplier_price:.1f} 元/件")
+        if quality_gate or purchase_threshold:
+            st.caption(
+                f"参考：质量分低于 {quality_gate:.0f} 通常不采购；质量达标后结合价格判断，综合门槛为 {purchase_threshold:.0f}。"
+            )
 
 
 def render_practice_feedback():
@@ -1029,6 +1118,8 @@ def render_trial(trials: list, mode: str):
                             "supplier_price": trial.get("supplier_price", ""),
                             "cost_score": trial.get("cost_score", ""),
                             "quality_gate": trial.get("quality_gate", ""),
+                            "quality_weight": trial.get("quality_weight", ""),
+                            "cost_weight": trial.get("cost_weight", ""),
                             "weighted_score": trial.get("weighted_score", ""),
                             "purchase_threshold": trial.get("purchase_threshold", ""),
                             "decision_zone": trial.get("decision_zone", ""),
