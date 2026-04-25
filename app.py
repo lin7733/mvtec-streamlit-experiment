@@ -199,10 +199,19 @@ def normalize_complexity(value: str) -> str:
 
 def normalize_okng_label(value: str) -> str:
     text = safe_str(value).lower().replace("（", "(").replace("）", ")")
-    if any(k in text for k in ["ok", "合格", "正常", "good", "无缺陷", "no defect"]):
-        return "OK"
-    if any(k in text for k in ["ng", "不合格", "缺陷", "异常", "bad", "defect"]):
+    compact = "".join(text.split())
+    if compact in {"0", "ng"}:
         return "NG"
+    if compact in {"1", "ok"}:
+        return "OK"
+    if compact.startswith("ng") or any(k in compact for k in ["不合格", "不正常", "异常", "bad"]):
+        return "NG"
+    if compact.startswith("ok") or any(k in compact for k in ["无缺陷", "正常", "good", "nodefect"]):
+        return "OK"
+    if "缺陷" in compact or ("defect" in compact and "nodefect" not in compact):
+        return "NG"
+    if "合格" in compact:
+        return "OK"
     return safe_str(value)
 
 
