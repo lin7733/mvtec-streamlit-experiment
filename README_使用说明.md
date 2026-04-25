@@ -59,8 +59,14 @@ pip install -r requirements.txt
 
 ## 三、启动方式
 
-```bash
-streamlit run app.py
+```powershell
+.\start_app.ps1
+```
+
+如果你仍然想手动启动，请明确使用项目虚拟环境：
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 ---
