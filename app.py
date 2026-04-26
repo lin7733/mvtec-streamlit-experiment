@@ -26,8 +26,11 @@ DATASET_ROOT = BASE_DIR / "00_raw"
 RESULTS_DIR_DEFAULT = BASE_DIR / "results"
 
 APP_TITLE = "AI辅助质检实验平台"
-BREAK_AFTER = 24
+FORMAL_TRIALS_PER_EXPERIMENT = 24
+PRACTICE_TRIALS_PER_EXPERIMENT = 2
+BREAK_AFTER = FORMAL_TRIALS_PER_EXPERIMENT
 OUTPUT_XLSX_NAME = "experiment_data.xlsx"
+PRODUCT_CATEGORIES = ("bottle", "capsule", "metal_nut")
 
 CONSENT_TEXT = """
 **知情同意书**
@@ -410,45 +413,130 @@ def load_all_banks():
     return workbook_path, exp1_df, exp2_df, practice_df
 
 
-def build_exp1_trials(df: pd.DataFrame, participant_key: str):
-    condition = "有解释" if stable_hash_int(participant_key) % 2 == 0 else "无解释"
+def shuffle_rows(df: pd.DataFrame, salt: str) -> pd.DataFrame:
+    indices = list(df.index)
+    rnd = random.Random(stable_hash_int(salt))
+    rnd.shuffle(indices)
+    return df.loc[indices].reset_index(drop=True)
+
+
+def split_quality_bank(df: pd.DataFrame, participant_key: str):
+    """拆分实验一/实验二共用质检题库，保证两实验不重复且各自平衡。"""
+    work = df.copy()
+    work["_category_norm"] = work["产品类别"].apply(normalize_category)
+    work["_label_norm"] = work["真实标签"].apply(normalize_okng_label)
+
+    exp1_parts = []
+    exp2_parts = []
+    for category in PRODUCT_CATEGORIES:
+        for label in ("OK", "NG"):
+            subset = work[(work["_category_norm"] == category) & (work["_label_norm"] == label)].copy()
+            if len(subset) < 8:
+                raise ValueError(
+                    f"质检题库中 {product_display_name(category)} / {label} 题量不足 8 道，"
+                    "无法拆分为实验一和实验二各 4 道。"
+                )
+            subset = shuffle_rows(subset, f"{participant_key}_quality_split_{category}_{label}")
+            exp1_parts.append(subset.iloc[:4])
+            exp2_parts.append(subset.iloc[4:8])
+
+    helper_cols = ["_category_norm", "_label_norm"]
+    exp1_df = pd.concat(exp1_parts, ignore_index=True).drop(columns=helper_cols)
+    exp2_df = pd.concat(exp2_parts, ignore_index=True).drop(columns=helper_cols)
+    return exp1_df, exp2_df
+
+
+def sample_purchase_bank(df: pd.DataFrame, participant_key: str) -> pd.DataFrame:
+    """从 48 道采购题中抽 24 道：每类产品 8 道，采购/不采购总数 12/12。"""
+    work = df.copy()
+    work["_category_norm"] = work["产品类别"].apply(normalize_category)
+    work["_purchase_code"] = work.apply(
+        lambda row: to_int(row.get("purchase_gt_code"), purchase_code(row.get("purchase_gt_label"))),
+        axis=1,
+    )
+
+    parts = []
+    for category in PRODUCT_CATEGORIES:
+        subset = work[work["_category_norm"] == category].copy()
+        buy_rows = shuffle_rows(
+            subset[subset["_purchase_code"] == 1].copy(),
+            f"{participant_key}_purchase_split_{category}_buy",
+        )
+        no_buy_rows = shuffle_rows(
+            subset[subset["_purchase_code"] == 0].copy(),
+            f"{participant_key}_purchase_split_{category}_no_buy",
+        )
+        if len(buy_rows) < 4 or len(no_buy_rows) < 4:
+            raise ValueError(
+                f"采购题库中 {product_display_name(category)} 的采购或不采购题量不足，"
+                "无法抽取采购 4 道、不采购 4 道。"
+            )
+        parts.append(buy_rows.iloc[:4])
+        parts.append(no_buy_rows.iloc[:4])
+
+    return pd.concat(parts, ignore_index=True).drop(columns=["_category_norm", "_purchase_code"])
+
+
+def build_quality_trials(
+    df: pd.DataFrame,
+    participant_key: str,
+    exp_name: str,
+    condition: str,
+    explanation_mode: str,
+    explanation_column: str,
+    order_salt: str,
+):
     trials = []
     for _, row in df.iterrows():
+        true_label = normalize_okng_label(row.get("真实标签"))
+        ai_label = normalize_okng_label(row.get("AI建议"))
         trials.append(
             {
                 "task_type": "exp1",
+                "exp_name": exp_name,
                 "trial_id": safe_str(row.get("题号")),
                 "item_id": safe_str(row.get("图片ID")),
                 "category": safe_str(row.get("产品类别")),
                 "defect_type": safe_str(row.get("缺陷类型")),
                 "complexity": safe_str(row.get("复杂度代码") or row.get("复杂度")),
-                "true_label": normalize_okng_label(row.get("真实标签")),
-                "true_code": to_int(row.get("真实标签代码"), okng_code(row.get("真实标签"))),
-                "ai_label": normalize_okng_label(row.get("AI建议")),
-                "ai_code": to_int(row.get("AI建议代码"), okng_code(row.get("AI建议"))),
+                "true_label": true_label,
+                "true_code": okng_code(true_label),
+                "ai_label": ai_label,
+                "ai_code": okng_code(ai_label),
                 "ai_correct": parse_ai_correct(
                     row.get("AI是否正确"),
-                    fallback=okng_code(row.get("AI建议")) == okng_code(row.get("真实标签")),
+                    fallback=okng_code(ai_label) == okng_code(true_label),
                 ),
                 "image_path": safe_str(row.get("图片源路径")),
-                "explanation_mode": "unified" if condition == "有解释" else "none",
-                "explanation_text": safe_str(row.get("实验一-统一解释内容")) if condition == "有解释" else "",
-                "exp_name": "实验一",
+                "explanation_mode": explanation_mode,
+                "explanation_text": safe_str(row.get(explanation_column)) if explanation_column else "",
+                "condition": condition,
                 "ui_decision_labels": ("OK", "NG"),
                 "feedback_text": "",
             }
         )
-    rnd = random.Random(stable_hash_int(participant_key + "_exp1_order"))
+    rnd = random.Random(stable_hash_int(participant_key + order_salt))
     rnd.shuffle(trials)
-    return trials, {"exp_name": "实验一", "design": "between", "condition": "with_expl" if condition == "有解释" else "no_expl"}
+    return trials
 
 
-def build_exp2_trials(df: pd.DataFrame, participant_key: str):
+def build_purchase_trials(
+    df: pd.DataFrame,
+    participant_key: str,
+    exp_name: str,
+    condition: str,
+    explanation_mode: str,
+    explanation_column: str,
+    order_salt: str,
+):
     trials = []
     for _, row in df.iterrows():
+        true_label = normalize_purchase_label(row.get("purchase_gt_label"))
+        ai_label = normalize_purchase_label(row.get("ai_suggestion_label"))
         trials.append(
             {
                 "task_type": "exp2",
+                "exp_name": exp_name,
                 "trial_id": safe_str(row.get("题号")),
                 "item_id": safe_str(row.get("图片ID")),
                 "category": safe_str(row.get("产品类别")),
@@ -463,114 +551,314 @@ def build_exp2_trials(df: pd.DataFrame, participant_key: str):
                 "cost_weight": to_float(row.get("cost_weight")),
                 "weighted_score": to_float(row.get("weighted_score")),
                 "purchase_threshold": to_float(row.get("purchase_threshold")),
-                "true_label": normalize_purchase_label(row.get("purchase_gt_label")),
-                "true_code": to_int(row.get("purchase_gt_code"), purchase_code(row.get("purchase_gt_label"))),
-                "ai_label": normalize_purchase_label(row.get("ai_suggestion_label")),
-                "ai_code": to_int(row.get("ai_suggestion_code"), purchase_code(row.get("ai_suggestion_label"))),
+                "true_label": true_label,
+                "true_code": to_int(row.get("purchase_gt_code"), purchase_code(true_label)),
+                "ai_label": ai_label,
+                "ai_code": to_int(row.get("ai_suggestion_code"), purchase_code(ai_label)),
                 "ai_correct": to_int(row.get("ai_correct_code"), parse_ai_correct(row.get("ai_correct_label"))),
                 "decision_zone": safe_str(row.get("decision_zone")),
                 "suggestion_type": safe_str(row.get("suggestion_type")),
-                "explanation_mode": "reason",
-                "explanation_text": safe_str(row.get("实验二-理由型解释内容")),
-                "exp_name": "实验二",
+                "explanation_mode": explanation_mode,
+                "explanation_text": safe_str(row.get(explanation_column)) if explanation_column else "",
+                "condition": condition,
                 "ui_decision_labels": ("采购", "不采购"),
                 "feedback_text": "",
             }
         )
-    rnd = random.Random(stable_hash_int(participant_key + "_exp2_order"))
+    rnd = random.Random(stable_hash_int(participant_key + order_salt))
     rnd.shuffle(trials)
-    return trials, {"exp_name": "实验二", "design": "single_task", "condition": "multi_objective_purchase"}
+    return trials
 
 
-def build_practice_trials(practice_df: pd.DataFrame, exp_name: str, exp2_df: pd.DataFrame = None):
-    filtered = practice_df[practice_df["适用实验"] == exp_name].copy().reset_index(drop=True)
-    exp2_lookup = {}
-    if exp2_df is not None and not exp2_df.empty:
-        for _, exp2_row in exp2_df.iterrows():
-            exp2_lookup[safe_str(exp2_row.get("题号"))] = exp2_row
+def build_practice_trials(
+    practice_df: pd.DataFrame,
+    exp_name: str,
+    source_exp_name: str,
+    row_offset: int = 0,
+    limit: int = PRACTICE_TRIALS_PER_EXPERIMENT,
+    quality_df: pd.DataFrame = None,
+    purchase_df: pd.DataFrame = None,
+    condition: str = "",
+    explanation_mode: str = "none",
+    explanation_column: str = "",
+):
+    filtered = practice_df[practice_df["适用实验"] == source_exp_name].copy().reset_index(drop=True)
+    filtered = filtered.iloc[row_offset : row_offset + limit].copy().reset_index(drop=True)
+
+    quality_lookup = {}
+    if quality_df is not None and not quality_df.empty:
+        for _, quality_row in quality_df.iterrows():
+            quality_lookup[safe_str(quality_row.get("题号"))] = quality_row
+
+    purchase_lookup = {}
+    if purchase_df is not None and not purchase_df.empty:
+        for _, purchase_row in purchase_df.iterrows():
+            purchase_lookup[safe_str(purchase_row.get("题号"))] = purchase_row
 
     trials = []
     for _, row in filtered.iterrows():
-        task_type = "exp1" if exp_name == "实验一" else "exp2"
+        task_type = "exp1" if source_exp_name == "实验一" else "exp2"
         if task_type == "exp1":
+            source_row = quality_lookup.get(safe_str(row.get("题号映射")))
+            true_label = normalize_okng_label(row.get("标准答案"))
+            ai_label = normalize_okng_label(row.get("AI建议"))
             trials.append(
                 {
                     "task_type": "exp1",
+                    "exp_name": exp_name,
                     "trial_id": safe_str(row.get("练习题号")),
                     "item_id": safe_str(row.get("图片ID")),
                     "category": safe_str(row.get("产品类别")),
                     "defect_type": safe_str(row.get("缺陷类型")),
                     "complexity": safe_str(row.get("复杂度")),
-                    "true_label": normalize_okng_label(row.get("标准答案")),
-                    "true_code": to_int(row.get("标准答案代码"), okng_code(row.get("标准答案"))),
-                    "ai_label": normalize_okng_label(row.get("AI建议")),
-                    "ai_code": to_int(row.get("AI建议代码"), okng_code(row.get("AI建议"))),
-                    "ai_correct": int(
-                        to_int(row.get("AI建议代码"), okng_code(row.get("AI建议")))
-                        == to_int(row.get("标准答案代码"), okng_code(row.get("标准答案")))
-                    ),
+                    "true_label": true_label,
+                    "true_code": okng_code(true_label),
+                    "ai_label": ai_label,
+                    "ai_code": okng_code(ai_label),
+                    "ai_correct": int(okng_code(ai_label) == okng_code(true_label)),
                     "image_path": safe_str(row.get("图片源路径")),
-                    "explanation_mode": "none",
-                    "explanation_text": "",
-                    "exp_name": "实验一",
+                    "explanation_mode": explanation_mode,
+                    "explanation_text": safe_str(source_row.get(explanation_column))
+                    if source_row is not None and explanation_column
+                    else "",
+                    "condition": condition,
                     "ui_decision_labels": ("OK", "NG"),
                     "feedback_text": safe_str(row.get("反馈文本")),
+                    "practice_source_exp": source_exp_name,
+                    "practice_source_trial_id": safe_str(row.get("题号映射")),
                     "is_practice": True,
                 }
             )
         else:
             feedback_text = safe_str(row.get("反馈文本"))
-            source_row = exp2_lookup.get(safe_str(row.get("题号映射")))
+            source_row = purchase_lookup.get(safe_str(row.get("题号映射")))
 
-            def exp2_value(exp2_column: str, practice_column: str = None):
+            def purchase_value(purchase_column: str, practice_column: str = None):
                 if source_row is not None:
-                    value = source_row.get(exp2_column)
+                    value = source_row.get(purchase_column)
                     if safe_str(value) != "":
                         return value
                 if practice_column:
                     return row.get(practice_column)
                 return ""
 
-            true_label_value = exp2_value("purchase_gt_label", "标准答案")
-            ai_label_value = exp2_value("ai_suggestion_label", "AI建议")
+            true_label_value = purchase_value("purchase_gt_label", "标准答案")
+            ai_label_value = purchase_value("ai_suggestion_label", "AI建议")
             trials.append(
                 {
                     "task_type": "exp2",
+                    "exp_name": exp_name,
                     "trial_id": safe_str(row.get("练习题号")),
                     "item_id": safe_str(row.get("图片ID")),
-                    "category": safe_str(exp2_value("产品类别", "产品类别")),
-                    "defect_type": safe_str(exp2_value("缺陷类型", "缺陷类型")),
-                    "complexity": safe_str(exp2_value("复杂度代码", "复杂度") or exp2_value("复杂度", "复杂度")),
+                    "category": safe_str(purchase_value("产品类别", "产品类别")),
+                    "defect_type": safe_str(purchase_value("缺陷类型", "缺陷类型")),
+                    "complexity": safe_str(purchase_value("复杂度代码", "复杂度") or purchase_value("复杂度", "复杂度")),
                     "image_path": safe_str(row.get("图片源路径")),
-                    "quality_score": to_float(exp2_value("quality_score")),
-                    "supplier_price": to_float(exp2_value("supplier_price")),
-                    "cost_score": to_float(exp2_value("cost_score")),
-                    "quality_gate": to_float(exp2_value("quality_gate")),
-                    "quality_weight": to_float(exp2_value("quality_weight")),
-                    "cost_weight": to_float(exp2_value("cost_weight")),
-                    "weighted_score": to_float(exp2_value("weighted_score")),
-                    "purchase_threshold": to_float(exp2_value("purchase_threshold")),
+                    "quality_score": to_float(purchase_value("quality_score")),
+                    "supplier_price": to_float(purchase_value("supplier_price")),
+                    "cost_score": to_float(purchase_value("cost_score")),
+                    "quality_gate": to_float(purchase_value("quality_gate")),
+                    "quality_weight": to_float(purchase_value("quality_weight")),
+                    "cost_weight": to_float(purchase_value("cost_weight")),
+                    "weighted_score": to_float(purchase_value("weighted_score")),
+                    "purchase_threshold": to_float(purchase_value("purchase_threshold")),
                     "true_label": normalize_purchase_label(true_label_value),
-                    "true_code": to_int(exp2_value("purchase_gt_code", "标准答案代码"), purchase_code(true_label_value)),
+                    "true_code": to_int(purchase_value("purchase_gt_code", "标准答案代码"), purchase_code(true_label_value)),
                     "ai_label": normalize_purchase_label(ai_label_value),
-                    "ai_code": to_int(exp2_value("ai_suggestion_code", "AI建议代码"), purchase_code(ai_label_value)),
+                    "ai_code": to_int(purchase_value("ai_suggestion_code", "AI建议代码"), purchase_code(ai_label_value)),
                     "ai_correct": to_int(
-                        exp2_value("ai_correct_code"),
+                        purchase_value("ai_correct_code"),
                         int(purchase_code(ai_label_value) == purchase_code(true_label_value)),
                     ),
-                    "decision_zone": safe_str(exp2_value("decision_zone")),
-                    "suggestion_type": safe_str(exp2_value("suggestion_type")),
-                    "explanation_mode": "reason",
-                    "explanation_text": safe_str(exp2_value("实验二-理由型解释内容")),
-                    "exp_name": "实验二",
+                    "decision_zone": safe_str(purchase_value("decision_zone")),
+                    "suggestion_type": safe_str(purchase_value("suggestion_type")),
+                    "explanation_mode": explanation_mode,
+                    "explanation_text": safe_str(purchase_value(explanation_column)) if explanation_column else "",
+                    "condition": condition,
                     "ui_decision_labels": ("采购", "不采购"),
                     "feedback_text": feedback_text,
                     "practice_task_type": safe_str(row.get("任务类型")),
+                    "practice_source_exp": source_exp_name,
                     "practice_source_trial_id": safe_str(row.get("题号映射")),
                     "is_practice": True,
                 }
             )
     return trials
+
+
+def build_experiment_sequence(exp12_df: pd.DataFrame, exp3_df: pd.DataFrame, practice_df: pd.DataFrame, participant_key: str):
+    exp1_df, exp2_quality_df = split_quality_bank(exp12_df, participant_key)
+    exp3_sample_df = sample_purchase_bank(exp3_df, participant_key)
+
+    exp1_condition = "with_explanation" if stable_hash_int(participant_key + "_exp1_condition") % 2 == 0 else "no_explanation"
+    exp1_explanation_column = "实验一-统一解释内容" if exp1_condition == "with_explanation" else ""
+    exp1_explanation_mode = "unified" if exp1_condition == "with_explanation" else "none"
+
+    exp2_condition = "metric" if stable_hash_int(participant_key + "_exp2_condition") % 2 == 0 else "reason"
+    exp2_explanation_column = "实验二-指标型解释内容" if exp2_condition == "metric" else "实验二-理由型解释内容"
+
+    exp3_condition = "metric" if stable_hash_int(participant_key + "_exp3_condition") % 2 == 0 else "reason"
+    exp3_explanation_column = "实验二-指标型解释内容" if exp3_condition == "metric" else "实验二-理由型解释内容"
+
+    exp1_trials = build_quality_trials(
+        exp1_df,
+        participant_key,
+        exp_name="实验一",
+        condition=exp1_condition,
+        explanation_mode=exp1_explanation_mode,
+        explanation_column=exp1_explanation_column,
+        order_salt="_exp1_order",
+    )
+    exp2_trials = build_quality_trials(
+        exp2_quality_df,
+        participant_key,
+        exp_name="实验二",
+        condition=exp2_condition,
+        explanation_mode=exp2_condition,
+        explanation_column=exp2_explanation_column,
+        order_salt="_exp2_order",
+    )
+    exp3_trials = build_purchase_trials(
+        exp3_sample_df,
+        participant_key,
+        exp_name="实验三",
+        condition=exp3_condition,
+        explanation_mode=exp3_condition,
+        explanation_column=exp3_explanation_column,
+        order_salt="_exp3_order",
+    )
+
+    exp1_practice = build_practice_trials(
+        practice_df,
+        exp_name="实验一",
+        source_exp_name="实验一",
+        row_offset=0,
+        quality_df=exp12_df,
+        condition=exp1_condition,
+        explanation_mode=exp1_explanation_mode,
+        explanation_column=exp1_explanation_column,
+    )
+    exp2_practice = build_practice_trials(
+        practice_df,
+        exp_name="实验二",
+        source_exp_name="实验一",
+        row_offset=PRACTICE_TRIALS_PER_EXPERIMENT,
+        quality_df=exp12_df,
+        condition=exp2_condition,
+        explanation_mode=exp2_condition,
+        explanation_column=exp2_explanation_column,
+    )
+    exp3_practice = build_practice_trials(
+        practice_df,
+        exp_name="实验三",
+        source_exp_name="实验二",
+        row_offset=0,
+        purchase_df=exp3_df,
+        condition=exp3_condition,
+        explanation_mode=exp3_condition,
+        explanation_column=exp3_explanation_column,
+    )
+
+    sequence = [
+        {
+            "meta": {
+                "exp_id": "exp1",
+                "exp_name": "实验一",
+                "task_family": "quality",
+                "design": "有无解释",
+                "condition": exp1_condition,
+                "formal_n": len(exp1_trials),
+                "practice_n": len(exp1_practice),
+            },
+            "trials": exp1_trials,
+            "practice_trials": exp1_practice,
+        },
+        {
+            "meta": {
+                "exp_id": "exp2",
+                "exp_name": "实验二",
+                "task_family": "quality",
+                "design": "解释形式",
+                "condition": exp2_condition,
+                "formal_n": len(exp2_trials),
+                "practice_n": len(exp2_practice),
+            },
+            "trials": exp2_trials,
+            "practice_trials": exp2_practice,
+        },
+        {
+            "meta": {
+                "exp_id": "exp3",
+                "exp_name": "实验三",
+                "task_family": "purchase",
+                "design": "多目标采购",
+                "condition": exp3_condition,
+                "formal_n": len(exp3_trials),
+                "practice_n": len(exp3_practice),
+            },
+            "trials": exp3_trials,
+            "practice_trials": exp3_practice,
+        },
+    ]
+
+    for item in sequence:
+        meta = item["meta"]
+        if len(item["trials"]) != FORMAL_TRIALS_PER_EXPERIMENT:
+            raise ValueError(f"{meta['exp_name']} 正式题数量为 {len(item['trials'])}，不是 24。")
+        if len(item["practice_trials"]) != PRACTICE_TRIALS_PER_EXPERIMENT:
+            raise ValueError(f"{meta['exp_name']} 练习题数量为 {len(item['practice_trials'])}，不是 2。")
+
+    exp1_ids = {trial["trial_id"] for trial in exp1_trials}
+    exp2_ids = {trial["trial_id"] for trial in exp2_trials}
+    if exp1_ids & exp2_ids:
+        raise ValueError("实验一与实验二正式题存在重复，请检查抽题逻辑。")
+
+    return sequence
+
+
+def experiment_sequence_meta() -> list:
+    return [item.get("meta", {}) for item in st.session_state.get("experiment_sequence", [])]
+
+
+def activate_experiment(index: int):
+    sequence = st.session_state.get("experiment_sequence", [])
+    if not sequence or index < 0 or index >= len(sequence):
+        st.error("实验序列未正确初始化，请返回首页重新开始。")
+        st.stop()
+    current = sequence[index]
+    st.session_state["experiment_index"] = index
+    st.session_state["exp_meta"] = current["meta"]
+    st.session_state["trials"] = current["trials"]
+    st.session_state["practice_trials"] = current["practice_trials"]
+    st.session_state["current_index"] = 0
+    st.session_state["current_render_id"] = None
+    st.session_state["trial_start_ts"] = None
+    st.session_state["exp_start_ts"] = None
+    st.session_state["trial_phase"] = "initial"
+    st.session_state["initial_decision_label"] = None
+    st.session_state["initial_decision_code"] = None
+    st.session_state["initial_rt_ms"] = None
+    st.session_state["show_practice_feedback"] = False
+    st.session_state["practice_feedback_text"] = ""
+
+
+def complete_current_experiment():
+    sequence = st.session_state.get("experiment_sequence", [])
+    current_index = st.session_state.get("experiment_index", 0)
+    current_meta = st.session_state.get("exp_meta", {})
+    st.session_state["completed_experiment_name"] = current_meta.get("exp_name", f"实验{current_index + 1}")
+    st.session_state["current_index"] = 0
+    st.session_state["current_render_id"] = None
+    st.session_state["trial_phase"] = "initial"
+    st.session_state["exp_start_ts"] = None
+
+    if current_index + 1 < len(sequence):
+        next_meta = sequence[current_index + 1].get("meta", {})
+        st.session_state["next_experiment_name"] = next_meta.get("exp_name", f"实验{current_index + 2}")
+        st.session_state["stage"] = "rest"
+    else:
+        st.session_state["next_experiment_name"] = ""
+        st.session_state["stage"] = "questionnaire"
 
 
 def participant_sheet_df() -> pd.DataFrame:
@@ -588,6 +876,8 @@ def participant_sheet_df() -> pd.DataFrame:
         "major": meta.get("major", ""),
         "exp_type": meta.get("exp_type", ""),
         "exp_condition": meta.get("exp_condition", ""),
+        "experiment_sequence": meta.get("experiment_sequence", ""),
+        "current_exp_name": exp_meta.get("exp_name", ""),
         "design": exp_meta.get("design", ""),
         "workbook_path": workbook_path,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -637,6 +927,7 @@ def save_progress():
         {
             "participant_meta": meta,
             "exp_meta": st.session_state.get("exp_meta", {}),
+            "experiment_sequence_meta": experiment_sequence_meta(),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "xlsx_path": str(xlsx_path),
         },
@@ -667,6 +958,8 @@ def init_session():
         "workbook_path": "",
         "participant_meta": {},
         "exp_meta": {},
+        "experiment_sequence": [],
+        "experiment_index": 0,
         "trials": [],
         "practice_trials": [],
         "current_index": 0,
@@ -684,6 +977,8 @@ def init_session():
         "show_debug": False,
         "show_practice_feedback": False,
         "practice_feedback_text": "",
+        "completed_experiment_name": "",
+        "next_experiment_name": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -693,10 +988,12 @@ def init_session():
 def reset_experiment():
     for key in list(st.session_state.keys()):
         if key in {
-            "stage", "workbook_path", "participant_meta", "exp_meta", "trials", "practice_trials",
+            "stage", "workbook_path", "participant_meta", "exp_meta", "experiment_sequence", "experiment_index",
+            "trials", "practice_trials",
             "current_index", "current_render_id", "trial_start_ts", "exp_start_ts", "responses",
             "questionnaire", "rest_done", "trial_phase", "initial_decision_label", "initial_decision_code",
-            "initial_rt_ms", "resolved_image_path", "show_debug", "show_practice_feedback", "practice_feedback_text"
+            "initial_rt_ms", "resolved_image_path", "show_debug", "show_practice_feedback", "practice_feedback_text",
+            "completed_experiment_name", "next_experiment_name"
         }:
             del st.session_state[key]
     init_session()
@@ -705,8 +1002,8 @@ def reset_experiment():
 def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.DataFrame):
     st.title(APP_TITLE)
     st.info(
-        "**参与须知：** 本实验分为实验一和实验二两种类型，**每位被试只需完成其中一种**。"
-        "请根据研究者安排选择实验类型，并如实填写以下基本信息。"
+        "**参与须知：** 本次实验包含三个连续实验：实验一“有无解释”、实验二“解释形式”、"
+        "实验三“多目标采购”。请按页面顺序完成全部三个实验，并如实填写以下基本信息。"
     )
 
     workbook_path = st.session_state.get("workbook_path", "") or find_workbook_path()
@@ -723,7 +1020,6 @@ def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.D
             gender = st.selectbox("性别 *", ["", "女", "男"])
         with c3:
             major = st.text_input("专业 *")
-            exp_name = st.selectbox("实验类型 *", ["实验一：有无解释（质检判断）", "实验二：多目标采购判断"])
 
         submitted = st.form_submit_button("确认并进入实验", use_container_width=True, type="primary")
 
@@ -743,24 +1039,22 @@ def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.D
             st.error(f"请填写以下必填项：{'、'.join(errors)}")
             return
 
-        exp_short = "exp1" if exp_name.startswith("实验一") else "exp2"
-        participant_id = build_participant_id(student_id, exp_short)
+        if exp1_df.empty or exp2_df.empty or practice_df.empty:
+            st.error("题库未成功加载完整，无法生成三个实验。")
+            return
+
+        participant_id = build_participant_id(student_id, "all3")
         participant_key = safe_str(student_id) or participant_id
 
-        if exp_short == "exp1":
-            if exp1_df.empty:
-                st.error("实验一题库未成功加载。")
-                return
-            trials, meta = build_exp1_trials(exp1_df, participant_key)
-            practice_trials = build_practice_trials(practice_df, "实验一")
-            exp_condition = meta.get("condition", "")
-        else:
-            if exp2_df.empty:
-                st.error("实验二题库未成功加载。")
-                return
-            trials, meta = build_exp2_trials(exp2_df, participant_key)
-            practice_trials = build_practice_trials(practice_df, "实验二", exp2_df)
-            exp_condition = meta.get("condition", "")
+        try:
+            sequence = build_experiment_sequence(exp1_df, exp2_df, practice_df, participant_key)
+        except Exception as e:
+            st.error(f"实验题目抽取失败：{e}")
+            return
+
+        sequence_summary = "；".join(
+            f"{item['meta']['exp_name']}={item['meta']['condition']}" for item in sequence
+        )
 
         st.session_state["participant_meta"] = {
             "participant_id": participant_id,
@@ -769,12 +1063,12 @@ def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.D
             "age": safe_str(age),
             "gender": gender,
             "major": safe_str(major),
-            "exp_type": exp_short,
-            "exp_condition": exp_condition,
+            "exp_type": "three_experiments",
+            "exp_condition": sequence_summary,
+            "experiment_sequence": "实验一 -> 实验二 -> 实验三",
         }
-        st.session_state["exp_meta"] = meta
-        st.session_state["trials"] = trials
-        st.session_state["practice_trials"] = practice_trials
+        st.session_state["experiment_sequence"] = sequence
+        activate_experiment(0)
         st.session_state["current_index"] = 0
         st.session_state["responses"] = []
         st.session_state["questionnaire"] = {}
@@ -787,23 +1081,28 @@ def render_setup(exp1_df: pd.DataFrame, exp2_df: pd.DataFrame, practice_df: pd.D
         st.rerun()
 
     with st.expander("查看题库摘要（研究者用）", expanded=False):
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("**实验一题量**")
+            st.markdown("**质检题库题量**")
             if not exp1_df.empty:
                 st.dataframe(
-                    exp1_df.groupby(["产品类别", "复杂度"]).size().reset_index(name="数量"),
+                    exp1_df.groupby(["产品类别", "真实标签"]).size().reset_index(name="数量"),
                     hide_index=True,
                     use_container_width=True,
                 )
         with c2:
-            st.markdown("**实验二题量**")
+            st.markdown("**采购题库题量**")
             if not exp2_df.empty:
                 st.dataframe(
-                    exp2_df.groupby(["产品类别", "复杂度", "suggestion_type"]).size().reset_index(name="数量"),
+                    exp2_df.groupby(["产品类别", "purchase_gt_label"]).size().reset_index(name="数量"),
                     hide_index=True,
                     use_container_width=True,
                 )
+        with c3:
+            st.markdown("**当前设计**")
+            st.write(f"每个实验正式题：{FORMAL_TRIALS_PER_EXPERIMENT} 道")
+            st.write(f"每个实验练习题：{PRACTICE_TRIALS_PER_EXPERIMENT} 道")
+            st.write("实验一与实验二正式题互不重复。")
 
 
 def render_consent():
@@ -822,10 +1121,16 @@ def render_consent():
 
 
 def render_instruction():
-    exp_type = st.session_state.get("participant_meta", {}).get("exp_type", "exp1")
-    st.title("实验说明")
+    exp_meta = st.session_state.get("exp_meta", {})
+    exp_name = exp_meta.get("exp_name", "当前实验")
+    task_family = exp_meta.get("task_family", "quality")
+    exp_no = st.session_state.get("experiment_index", 0) + 1
+    exp_total = max(len(st.session_state.get("experiment_sequence", [])), 1)
 
-    if exp_type == "exp1":
+    st.title(f"{exp_name}说明")
+    st.caption(f"实验进度：{exp_no} / {exp_total}")
+
+    if task_family == "quality":
         st.markdown("---")
         st.markdown("### 一、实验任务")
         st.markdown(
@@ -859,7 +1164,7 @@ def render_instruction():
 > 请先仔细观察产品图像，根据自己的判断选择 OK 或 NG。
 
 **第二步 — 参考 AI 后最终决策**
-> 完成初步判断后，系统会显示 AI 的检测结果（部分被试会看到解释信息）。
+> 完成初步判断后，系统会显示 AI 的检测结果与可能的解释信息。
 > 请综合图像与 AI 建议，给出你的最终判断。最终判断可与初步判断相同或不同。
             """
         )
@@ -903,7 +1208,7 @@ def render_instruction():
 > 先根据图像、质量信息和供应价格，独立判断“采购”或“不采购”。
 
 **第二步 — 参考 AI 后最终决策**
-> 完成初步判断后，系统会显示 AI 的采购建议。
+> 完成初步判断后，系统会显示 AI 的采购建议与解释信息。
 > 请综合你自己的判断与 AI 建议，给出最终判断。最终判断可与初步判断相同或不同。
             """
         )
@@ -912,11 +1217,12 @@ def render_instruction():
     st.markdown(
         f"""
 **⚠️ 注意事项**
-- 前 **4 题** 为练习题，不计入正式数据。
-- 正式实验共 **48 题**，中途会有一次短暂休息（第 {BREAK_AFTER} 题后）。
+- 本阶段为 **{exp_name}**。
+- 前 **{len(st.session_state.get("practice_trials", []))} 题** 为练习题，不计入正式数据。
+- 正式题共 **{len(st.session_state.get("trials", []))} 题**。
 - 系统会记录你的两次判断和反应时间。
 - 练习题会显示标准答案反馈，正式题不会显示。
-- 实验结束后请完成问卷。
+- 完成当前正式实验后，系统会提示接下来进入下一实验，并建议休息 1–2 分钟。
         """
     )
 
@@ -926,7 +1232,7 @@ def render_instruction():
             st.session_state["stage"] = "consent"
             st.rerun()
     with c2:
-        if st.button("进入练习题", type="primary", use_container_width=True):
+        if st.button(f"进入{exp_name}练习题", type="primary", use_container_width=True):
             st.session_state["stage"] = "practice"
             st.session_state["current_index"] = 0
             st.session_state["current_render_id"] = None
@@ -934,14 +1240,15 @@ def render_instruction():
 
 
 def render_rest():
-    st.title("请稍作休息 ☕")
-    st.markdown("你已完成前 24 题，建议休息 1–2 分钟后再继续。")
-    elapsed = int(time.time() - (st.session_state.get("exp_start_ts") or time.time()))
-    st.info(f"当前已用时：{elapsed // 60} 分 {elapsed % 60} 秒")
-    if st.button("我已休息好，继续实验", type="primary", use_container_width=True):
-        st.session_state["rest_done"] = True
-        st.session_state["stage"] = "formal"
-        st.session_state["current_render_id"] = None
+    completed = st.session_state.get("completed_experiment_name", "当前实验")
+    next_name = st.session_state.get("next_experiment_name", "下一实验")
+    st.title("请稍作休息")
+    st.success(f"你已完成{completed}。")
+    st.markdown(f"接下来你将开始 **{next_name}**，请休息 1–2 分钟后再开始。")
+    if st.button(f"开始{next_name}", type="primary", use_container_width=True):
+        next_index = st.session_state.get("experiment_index", 0) + 1
+        activate_experiment(next_index)
+        st.session_state["stage"] = "instruction"
         st.rerun()
 
 
@@ -981,20 +1288,23 @@ def render_practice_feedback():
 def render_trial(trials: list, mode: str):
     idx = st.session_state["current_index"]
     total = len(trials)
+    exp_meta = st.session_state.get("exp_meta", {})
+    exp_name = exp_meta.get("exp_name", "")
+    exp_no = st.session_state.get("experiment_index", 0) + 1
+    exp_total = max(len(st.session_state.get("experiment_sequence", [])), 1)
 
     if idx >= total:
         st.session_state["current_index"] = 0
-        st.session_state["stage"] = "formal" if mode == "practice" else "questionnaire"
         st.session_state["current_render_id"] = None
         st.session_state["trial_phase"] = "initial"
-        st.rerun()
-
-    if mode == "formal" and idx == BREAK_AFTER and not st.session_state.get("rest_done", False):
-        st.session_state["stage"] = "rest"
+        if mode == "practice":
+            st.session_state["stage"] = "formal"
+        else:
+            complete_current_experiment()
         st.rerun()
 
     trial = trials[idx]
-    render_uid = f"{mode}_{trial['task_type']}_{trial['trial_id']}_{idx}"
+    render_uid = f"{exp_meta.get('exp_id', 'exp')}_{mode}_{trial['task_type']}_{trial['trial_id']}_{idx}"
 
     if st.session_state["current_render_id"] != render_uid:
         st.session_state["current_render_id"] = render_uid
@@ -1015,15 +1325,16 @@ def render_trial(trials: list, mode: str):
         em, es = elapsed // 60, elapsed % 60
         st.markdown(
             f"<div style='text-align:center;padding:6px 0;font-size:0.95rem;'>"
-            f"⏱️ 已用时 <b>{em:02d}:{es:02d}</b> &nbsp;|&nbsp; 题目进度 <b>{idx + 1} / {total}</b>"
+            f"⏱️ 已用时 <b>{em:02d}:{es:02d}</b> &nbsp;|&nbsp; "
+            f"{exp_name} <b>{exp_no} / {exp_total}</b> &nbsp;|&nbsp; 正式题 <b>{idx + 1} / {total}</b>"
             f"</div>",
             unsafe_allow_html=True,
         )
         st.progress((idx + 1) / total)
     else:
-        st.progress((idx + 1) / total, text=f"练习题进度：{idx + 1}/{total}")
+        st.progress((idx + 1) / total, text=f"{exp_name}练习题进度：{idx + 1}/{total}")
 
-    st.subheader(f"{'练习题' if mode == 'practice' else '正式题'} {idx + 1} / {total}")
+    st.subheader(f"{exp_name}{'练习题' if mode == 'practice' else '正式题'} {idx + 1} / {total}")
 
     if mode == "practice" and st.session_state.get("show_practice_feedback"):
         render_practice_feedback()
@@ -1099,11 +1410,17 @@ def render_trial(trials: list, mode: str):
                 record = {
                     "participant_id": meta.get("participant_id", ""),
                     "exp_type": meta.get("exp_type", ""),
-                    "exp_condition": meta.get("exp_condition", ""),
+                    "participant_condition_summary": meta.get("exp_condition", ""),
+                    "exp_id": exp_meta.get("exp_id", ""),
+                    "exp_name": exp_meta.get("exp_name", trial.get("exp_name", "")),
+                    "exp_sequence_index": st.session_state.get("experiment_index", 0) + 1,
+                    "exp_condition": exp_meta.get("condition", trial.get("condition", "")),
                     "design": exp_meta.get("design", ""),
+                    "task_family": exp_meta.get("task_family", ""),
                     "task_type": trial["task_type"],
                     "trial_stage": mode,
                     "trial_index": idx + 1,
+                    "global_formal_index": len(st.session_state.get("responses", [])) + 1 if mode != "practice" else "",
                     "trial_id": trial["trial_id"],
                     "item_id": trial["item_id"],
                     "category": normalize_category(trial["category"]),
@@ -1115,6 +1432,7 @@ def render_trial(trials: list, mode: str):
                     "ai_code": trial["ai_code"],
                     "ai_correct": trial["ai_correct"],
                     "explanation_mode": trial["explanation_mode"],
+                    "explanation_text": safe_str(trial.get("explanation_text", "")),
                     "initial_decision_label": init_label,
                     "initial_decision_code": init_code,
                     "final_decision_label": label,
@@ -1170,8 +1488,7 @@ def render_trial(trials: list, mode: str):
 
 def render_questionnaire():
     st.title("实验结束问卷")
-    st.markdown("请根据你在实验中的真实感受作答，没有对错之分。")
-    exp_type = st.session_state.get("participant_meta", {}).get("exp_type", "exp1")
+    st.markdown("你已完成三个实验。请根据整个实验过程中的真实感受作答，没有对错之分。")
 
     with st.form("questionnaire_form"):
         st.markdown("### 第一部分：对 AI 系统的整体评价")
@@ -1187,41 +1504,34 @@ def render_questionnaire():
         nasa_frustration = st.slider("8. 挫败感：你在任务中感到多少挫败、烦躁或压力？", 0, 100, 50)
         nasa_performance = st.slider("9. 你对自己在任务中表现的满意程度如何？", 0, 100, 50)
 
-        st.markdown("### 第三部分：判断策略")
-        if exp_type == "exp1":
-            strategy = st.radio(
-                "10. 在做最终判断时，你通常的策略是？",
-                ["主要依靠自己的图像判断", "图像判断和AI建议各参考一半", "主要参考AI建议", "视情况而定"],
-                index=3,
-            )
-            changed_reason = st.radio(
-                "11. 当你改变了初步判断时，主要原因是？",
-                ["AI建议与我不同，选择相信AI", "AI的解释让我重新审视图像", "不确定时偏向跟随AI", "我没有改变过判断"],
-                index=3,
-            )
-            extra = {}
-        else:
-            strategy = st.radio(
-                "10. 在做最终判断时，你通常更偏向哪种策略？",
-                ["主要看质量，再兼顾成本", "质量与成本大致各占一半", "主要看成本，只要质量别太差", "视情况而定"],
-                index=1,
-            )
-            changed_reason = st.radio(
-                "11. 当你改变了初步判断时，主要原因是？",
-                ["AI建议与我不同，选择相信AI", "看到质量信息后改变了判断", "看到价格后改变了判断", "我没有改变过判断"],
-                index=3,
-            )
-            st.markdown("### 第四部分：多目标采购判断感受")
-            quality_priority = st.slider("12. 在本实验中，你认为质量信息的重要性有多高？", 1, 7, 5)
-            cost_priority = st.slider("13. 在本实验中，你认为价格信息的重要性有多高？", 1, 7, 4)
-            rule_awareness = st.slider("14. 你是否感觉系统内部存在某种固定的采购判断规则？", 1, 7, 5)
-            extra = {
-                "quality_priority": quality_priority,
-                "cost_priority": cost_priority,
-                "rule_awareness": rule_awareness,
-            }
+        st.markdown("### 第三部分：质检判断策略")
+        quality_strategy = st.radio(
+            "10. 在实验一和实验二的质检判断中，你通常的策略是？",
+            ["主要依靠自己的图像判断", "图像判断和AI建议各参考一半", "主要参考AI建议", "视情况而定"],
+            index=3,
+        )
+        quality_changed_reason = st.radio(
+            "11. 在质检判断中，当你改变了初步判断时，主要原因是？",
+            ["AI建议与我不同，选择相信AI", "AI的解释让我重新审视图像", "不确定时偏向跟随AI", "我没有改变过判断"],
+            index=3,
+        )
 
-        comments = st.text_area("15. 如有其他想说的（例如：哪些题目较难、对实验的建议等），请在此填写：", placeholder="选填")
+        st.markdown("### 第四部分：多目标采购判断策略")
+        purchase_strategy = st.radio(
+            "12. 在实验三的采购判断中，你通常更偏向哪种策略？",
+            ["主要看质量，再兼顾成本", "质量与成本大致各占一半", "主要看成本，只要质量别太差", "视情况而定"],
+            index=1,
+        )
+        purchase_changed_reason = st.radio(
+            "13. 在采购判断中，当你改变了初步判断时，主要原因是？",
+            ["AI建议与我不同，选择相信AI", "看到质量信息后改变了判断", "看到价格后改变了判断", "我没有改变过判断"],
+            index=3,
+        )
+        quality_priority = st.slider("14. 在采购判断中，你认为质量信息的重要性有多高？", 1, 7, 5)
+        cost_priority = st.slider("15. 在采购判断中，你认为价格信息的重要性有多高？", 1, 7, 4)
+        rule_awareness = st.slider("16. 你是否感觉系统内部存在某种固定的采购判断规则？", 1, 7, 5)
+
+        comments = st.text_area("17. 如有其他想说的（例如：哪些题目较难、对实验的建议等），请在此填写：", placeholder="选填")
         submitted = st.form_submit_button("提交问卷", type="primary", use_container_width=True)
 
     if submitted:
@@ -1235,10 +1545,14 @@ def render_questionnaire():
             "nasa_effort": nasa_effort,
             "nasa_frustration": nasa_frustration,
             "nasa_performance": nasa_performance,
-            "strategy": map_strategy_code(strategy),
-            "changed_reason": map_changed_reason_code(changed_reason),
+            "quality_strategy": map_strategy_code(quality_strategy),
+            "quality_changed_reason": map_changed_reason_code(quality_changed_reason),
+            "purchase_strategy": map_strategy_code(purchase_strategy),
+            "purchase_changed_reason": map_changed_reason_code(purchase_changed_reason),
+            "quality_priority": quality_priority,
+            "cost_priority": cost_priority,
+            "rule_awareness": rule_awareness,
             "comments": safe_str(comments),
-            **extra,
         }
         save_progress()
         st.session_state["stage"] = "finish"
@@ -1247,7 +1561,7 @@ def render_questionnaire():
 
 def render_finish():
     st.title("🎉 实验完成")
-    st.success("感谢你的参与，数据已自动保存。")
+    st.success("感谢你的参与，三个实验的数据已自动保存。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
     out_dir = ensure_results_dir(participant_id)
     save_progress()
