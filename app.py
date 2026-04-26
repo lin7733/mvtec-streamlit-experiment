@@ -11,6 +11,13 @@ import pandas as pd
 from PIL import Image, ImageFile
 import streamlit as st
 
+try:
+    import gspread
+    from gspread.exceptions import WorksheetNotFound
+except Exception:
+    gspread = None
+    WorksheetNotFound = Exception
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 st.set_page_config(
@@ -979,6 +986,8 @@ def init_session():
         "practice_feedback_text": "",
         "completed_experiment_name": "",
         "next_experiment_name": "",
+        "google_uploaded": False,
+        "google_upload_message": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -993,7 +1002,7 @@ def reset_experiment():
             "current_index", "current_render_id", "trial_start_ts", "exp_start_ts", "responses",
             "questionnaire", "rest_done", "trial_phase", "initial_decision_label", "initial_decision_code",
             "initial_rt_ms", "resolved_image_path", "show_debug", "show_practice_feedback", "practice_feedback_text",
-            "completed_experiment_name", "next_experiment_name"
+            "completed_experiment_name", "next_experiment_name", "google_uploaded", "google_upload_message"
         }:
             del st.session_state[key]
     init_session()
@@ -1559,12 +1568,116 @@ def render_questionnaire():
         st.rerun()
 
 
+
+def dataframe_to_sheet_values(df: pd.DataFrame) -> list:
+    """将 DataFrame 转为 Google Sheets 可写入的二维列表。"""
+    if df is None or df.empty:
+        return []
+    safe_df = df.copy()
+    safe_df = safe_df.astype(object).where(pd.notna(safe_df), "")
+    return safe_df.astype(str).values.tolist()
+
+
+def get_google_sheet_config():
+    """
+    从 Streamlit Secrets 读取 Google Sheets 配置。
+
+    需要在 Streamlit Cloud 的 App secrets 中配置：
+    google_sheet_id = "你的表格ID"
+
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+    client_email = "..."
+    client_id = "..."
+    auth_uri = "https://accounts.google.com/o/oauth2/auth"
+    token_uri = "https://oauth2.googleapis.com/token"
+    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+    client_x509_cert_url = "..."
+    """
+    try:
+        sheet_id = st.secrets.get("google_sheet_id", "")
+        service_account_info = st.secrets.get("gcp_service_account", None)
+    except Exception:
+        return "", None
+    return sheet_id, service_account_info
+
+
+def google_sheets_is_configured() -> bool:
+    sheet_id, service_account_info = get_google_sheet_config()
+    return bool(gspread is not None and sheet_id and service_account_info)
+
+
+def get_or_create_worksheet(spreadsheet, sheet_name: str, headers: list):
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=sheet_name,
+            rows=max(1000, len(headers) + 10),
+            cols=max(26, len(headers)),
+        )
+        worksheet.update("A1", [headers])
+        return worksheet
+
+    existing_headers = worksheet.row_values(1)
+    if not existing_headers:
+        worksheet.update("A1", [headers])
+    return worksheet
+
+
+def append_df_to_google_sheet(spreadsheet, sheet_name: str, df: pd.DataFrame):
+    if df is None or df.empty:
+        return
+    headers = [str(c) for c in df.columns]
+    worksheet = get_or_create_worksheet(spreadsheet, sheet_name, headers)
+    values = dataframe_to_sheet_values(df)
+    if values:
+        worksheet.append_rows(values, value_input_option="USER_ENTERED")
+
+
+def upload_current_result_to_google_sheets() -> tuple[bool, str]:
+    """实验完成后，将 participant/questionnaire/trial 三张表追加到同一个 Google Sheet。"""
+    if st.session_state.get("google_uploaded"):
+        return True, st.session_state.get("google_upload_message", "数据已上传至 Google Sheet。")
+
+    if not google_sheets_is_configured():
+        if gspread is None:
+            return False, "未安装 gspread，无法自动上传。请在 requirements.txt 中加入 gspread。"
+        return False, "尚未配置 Google Sheets 密钥，当前仍可通过页面按钮下载 Excel。"
+
+    try:
+        sheet_id, service_account_info = get_google_sheet_config()
+        client = gspread.service_account_from_dict(dict(service_account_info))
+        spreadsheet = client.open_by_key(sheet_id)
+
+        append_df_to_google_sheet(spreadsheet, "participant_info", participant_sheet_df())
+        append_df_to_google_sheet(spreadsheet, "questionnaire", questionnaire_sheet_df())
+        append_df_to_google_sheet(spreadsheet, "trial_data", trial_sheet_df())
+
+        msg = "数据已自动上传至研究者的 Google Sheet 总表。"
+        st.session_state["google_uploaded"] = True
+        st.session_state["google_upload_message"] = msg
+        return True, msg
+    except Exception as e:
+        return False, f"Google Sheet 自动上传失败：{e}。请使用下方按钮下载 Excel 后发给研究者。"
+
+
 def render_finish():
     st.title("🎉 实验完成")
     st.success("感谢你的参与，三个实验的数据已自动保存。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
     out_dir = ensure_results_dir(participant_id)
     save_progress()
+
+    uploaded, upload_message = upload_current_result_to_google_sheets()
+    if uploaded:
+        st.success(upload_message)
+    else:
+        st.warning(upload_message)
+
     st.markdown("研究者可在以下位置找到保存文件：")
     st.code(str(out_dir / OUTPUT_XLSX_NAME), language="text")
     st.info("如果你使用的是线上 Streamlit 链接，上面的路径是云端服务器路径，不是本机 D 盘路径。请点击下面按钮下载实验数据。")
