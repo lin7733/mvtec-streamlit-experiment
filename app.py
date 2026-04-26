@@ -4,6 +4,7 @@ import json
 import random
 import time
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -642,6 +643,24 @@ def save_progress():
     )
 
 
+def build_result_workbook_bytes() -> bytes:
+    participant_df = participant_sheet_df()
+    questionnaire_df = questionnaire_sheet_df()
+    trial_df = trial_sheet_df()
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        participant_df.to_excel(writer, sheet_name="participant_info", index=False)
+        (questionnaire_df if not questionnaire_df.empty else pd.DataFrame(columns=["participant_id"])).to_excel(
+            writer, sheet_name="questionnaire", index=False
+        )
+        (trial_df if not trial_df.empty else pd.DataFrame(columns=["participant_id", "trial_id"])).to_excel(
+            writer, sheet_name="trial_data", index=False
+        )
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def init_session():
     defaults = {
         "stage": "setup",
@@ -1231,8 +1250,17 @@ def render_finish():
     st.success("感谢你的参与，数据已自动保存。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
     out_dir = ensure_results_dir(participant_id)
+    save_progress()
     st.markdown("研究者可在以下位置找到保存文件：")
     st.code(str(out_dir / OUTPUT_XLSX_NAME), language="text")
+    st.info("如果你使用的是线上 Streamlit 链接，上面的路径是云端服务器路径，不是本机 D 盘路径。请点击下面按钮下载实验数据。")
+    st.download_button(
+        "⬇️ 下载本次实验数据（Excel）",
+        data=build_result_workbook_bytes(),
+        file_name=f"{participant_id}_{OUTPUT_XLSX_NAME}",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
     if st.button("🏠 下一位被试（返回首页）", use_container_width=True, type="primary"):
         reset_experiment()
