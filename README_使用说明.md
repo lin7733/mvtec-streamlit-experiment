@@ -38,6 +38,29 @@ MVTec_AD_Thesis/
 
 都可以。
 
+### 2.1）公网部署图片目录
+
+如果部署到 Streamlit Cloud，推荐使用压缩后的图片目录：
+
+```text
+streamlit_mvtec_experiment/
+└── 00_raw_compressed/
+    ├── bottle/
+    ├── capsule/
+    └── metal_nut/
+```
+
+这个目录必须和 `app.py` 一起提交到 GitHub 当前部署分支。Streamlit Cloud 页面里的
+`/mount/src/.../00_raw_compressed` 是云端容器路径；如果它提示不存在，通常说明
+`00_raw_compressed` 没有被提交或没有推送到正在部署的仓库分支。
+
+当前程序会优先读取 `00_raw_compressed`，找不到时再尝试 `00_raw`。如果你使用其他目录名，
+可以在部署环境变量中设置：
+
+```text
+MVTEC_DATASET_ROOT=你的图片目录名
+```
+
 ### 3）可选：解释文本优化脚本
 如果你想根据 `ground_truth` 自动重写解释文本，可运行：
 
