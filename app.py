@@ -38,7 +38,7 @@ st.set_page_config(
 BASE_DIR = Path(__file__).resolve().parent
 WORKBOOK_FILENAME = "AI_质检实验题库_实验一实验二_多目标采购版_AI正确率75版.xlsx"
 WORKBOOK_FALLBACK_FILENAMES = ["AI_质检实验题库_实验一实验二_多目标采购版.xlsx"]
-DATASET_ROOT = BASE_DIR / "00_raw"
+DATASET_ROOT = BASE_DIR / "00_raw_compressed"
 RESULTS_DIR_DEFAULT = BASE_DIR / "results"
 
 APP_TITLE = "AI辅助质检实验平台"
