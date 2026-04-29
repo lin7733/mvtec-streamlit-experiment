@@ -29,7 +29,7 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).resolve().parent
 WORKBOOK_FILENAME = "AI_质检实验题库_实验一实验二_多目标采购版.xlsx"
-DATASET_ROOT = BASE_DIR / "00_raw"
+DATASET_ROOT = BASE_DIR / "00_raw_compressed"
 RESULTS_DIR_DEFAULT = BASE_DIR / "results"
 
 APP_TITLE = "AI辅助质检实验平台"
@@ -322,6 +322,10 @@ def calc_dependence(adopted: int, ai_correct: int) -> str:
         return "proper" if adopted == 1 else "under"
     return "over" if adopted == 1 else "proper"
 
+@st.cache_data(show_spinner=False)
+def load_image_bytes(image_path_str: str) -> bytes:
+    with open(image_path_str, "rb") as f:
+        return f.read()
 
 def resolve_image_path(raw_path: str) -> Path:
     if not raw_path:
@@ -988,6 +992,7 @@ def init_session():
         "next_experiment_name": "",
         "google_uploaded": False,
         "google_upload_message": "",
+        "final_saved": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -997,6 +1002,7 @@ def init_session():
 def reset_experiment():
     for key in list(st.session_state.keys()):
         if key in {
+            "final_saved",
             "stage", "workbook_path", "participant_meta", "exp_meta", "experiment_sequence", "experiment_index",
             "trials", "practice_trials",
             "current_index", "current_render_id", "trial_start_ts", "exp_start_ts", "responses",
@@ -1356,7 +1362,8 @@ def render_trial(trials: list, mode: str):
         try:
             img_path = resolve_image_path(trial["image_path"])
             st.session_state["resolved_image_path"] = str(img_path)
-            st.image(Image.open(img_path).convert("RGB"), use_container_width=True)
+            img_bytes = load_image_bytes(str(img_path))
+            st.image(img_bytes, use_container_width=True)
             if st.session_state.get("show_debug"):
                 st.caption(f"图片路径：{img_path}")
         except Exception as e:
@@ -1475,7 +1482,10 @@ def render_trial(trials: list, mode: str):
 
                 if mode != "practice":
                     st.session_state["responses"].append(record)
-                    save_progress()
+
+                    if idx + 1 >= total:
+                        save_progress()
+
                     st.session_state["current_index"] += 1
                     st.session_state["current_render_id"] = None
                     st.session_state["trial_phase"] = "initial"
@@ -1705,9 +1715,13 @@ def upload_current_result_to_google_sheets() -> tuple[bool, str]:
 def render_finish():
     st.title("🎉 实验完成")
     st.success("感谢你的参与，三个实验的数据已自动保存。")
+
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
     out_dir = ensure_results_dir(participant_id)
-    save_progress()
+
+    if not st.session_state.get("final_saved", False):
+        save_progress()
+        st.session_state["final_saved"] = True
 
     uploaded, upload_message = upload_current_result_to_google_sheets()
     if uploaded:
