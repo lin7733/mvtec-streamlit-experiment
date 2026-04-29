@@ -11,6 +11,14 @@ import pandas as pd
 from PIL import Image, ImageFile
 import streamlit as st
 
+@st.cache_data(show_spinner=False)
+
+def load_image_bytes(image_path_str: str) -> bytes:
+
+    with open(image_path_str, "rb") as f:
+
+        return f.read()
+
 try:
     import gspread
     from gspread.exceptions import WorksheetNotFound
@@ -28,7 +36,8 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-WORKBOOK_FILENAME = "AI_质检实验题库_实验一实验二_多目标采购版.xlsx"
+WORKBOOK_FILENAME = "AI_质检实验题库_实验一实验二_多目标采购版_AI正确率75版.xlsx"
+WORKBOOK_FALLBACK_FILENAMES = ["AI_质检实验题库_实验一实验二_多目标采购版.xlsx"]
 DATASET_ROOT = BASE_DIR / "00_raw"
 RESULTS_DIR_DEFAULT = BASE_DIR / "results"
 
@@ -121,10 +130,15 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def find_workbook_path() -> Path:
-    candidates = [
-        BASE_DIR / "05_metadata" / WORKBOOK_FILENAME,
-        BASE_DIR / WORKBOOK_FILENAME,
-    ]
+    workbook_filenames = [WORKBOOK_FILENAME, *WORKBOOK_FALLBACK_FILENAMES]
+    candidates = []
+    for filename in workbook_filenames:
+        candidates.extend(
+            [
+                BASE_DIR / "05_metadata" / filename,
+                BASE_DIR / filename,
+            ]
+        )
     for p in candidates:
         if p.exists() and p.is_file():
             return p
@@ -454,34 +468,67 @@ def split_quality_bank(df: pd.DataFrame, participant_key: str):
 
 
 def sample_purchase_bank(df: pd.DataFrame, participant_key: str) -> pd.DataFrame:
-    """从 48 道采购题中抽 24 道：每类产品 8 道，采购/不采购总数 12/12。"""
+    """从 48 道采购题中抽 24 道：每类产品 8 道，采购/不采购 12/12，AI 正确率 75%。"""
     work = df.copy()
     work["_category_norm"] = work["产品类别"].apply(normalize_category)
     work["_purchase_code"] = work.apply(
         lambda row: to_int(row.get("purchase_gt_code"), purchase_code(row.get("purchase_gt_label"))),
         axis=1,
     )
+    work["_ai_correct"] = work.apply(
+        lambda row: to_int(
+            row.get("ai_correct_code"),
+            int(
+                to_int(row.get("ai_suggestion_code"), purchase_code(row.get("ai_suggestion_label")))
+                == to_int(row.get("purchase_gt_code"), purchase_code(row.get("purchase_gt_label")))
+            ),
+        ),
+        axis=1,
+    )
 
     parts = []
     for category in PRODUCT_CATEGORIES:
         subset = work[work["_category_norm"] == category].copy()
-        buy_rows = shuffle_rows(
-            subset[subset["_purchase_code"] == 1].copy(),
-            f"{participant_key}_purchase_split_{category}_buy",
-        )
-        no_buy_rows = shuffle_rows(
-            subset[subset["_purchase_code"] == 0].copy(),
-            f"{participant_key}_purchase_split_{category}_no_buy",
-        )
-        if len(buy_rows) < 4 or len(no_buy_rows) < 4:
-            raise ValueError(
-                f"采购题库中 {product_display_name(category)} 的采购或不采购题量不足，"
-                "无法抽取采购 4 道、不采购 4 道。"
-            )
-        parts.append(buy_rows.iloc[:4])
-        parts.append(no_buy_rows.iloc[:4])
 
-    return pd.concat(parts, ignore_index=True).drop(columns=["_category_norm", "_purchase_code"])
+        selected = []
+        # 每个产品抽 8 道：采购 4 / 不采购 4，AI 正确 6 / 错误 2。
+        # 优先让采购和不采购各含 1 道 AI 错误；若题库分布不允许，再使用可行组合。
+        for purchase_wrong_n in [1, 0, 2]:
+            plan = {
+                (1, 1): 4 - purchase_wrong_n,
+                (1, 0): purchase_wrong_n,
+                (0, 1): 2 + purchase_wrong_n,
+                (0, 0): 2 - purchase_wrong_n,
+            }
+            candidate = []
+            feasible = True
+            for (purchase_code_value, ai_correct_value), need_n in plan.items():
+                if need_n <= 0:
+                    continue
+                pool = subset[
+                    (subset["_purchase_code"] == purchase_code_value)
+                    & (subset["_ai_correct"] == ai_correct_value)
+                ].copy()
+                if len(pool) < need_n:
+                    feasible = False
+                    break
+                pool = shuffle_rows(
+                    pool,
+                    f"{participant_key}_purchase_split_{category}_{purchase_code_value}_{ai_correct_value}",
+                )
+                candidate.append(pool.iloc[:need_n])
+            if feasible:
+                selected = candidate
+                break
+
+        if not selected:
+            raise ValueError(
+                f"采购题库中 {product_display_name(category)} 的 AI 正确/错误题量不足，"
+                "无法抽取采购 4 道、不采购 4 道且 AI 正确率 75% 的正式题。"
+            )
+        parts.extend(selected)
+
+    return pd.concat(parts, ignore_index=True).drop(columns=["_category_norm", "_purchase_code", "_ai_correct"])
 
 
 def build_quality_trials(
@@ -986,8 +1033,9 @@ def init_session():
         "practice_feedback_text": "",
         "completed_experiment_name": "",
         "next_experiment_name": "",
+        "final_saved": False,
         "google_uploaded": False,
-        "google_upload_message": "",
+        "google_upload_error": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -997,6 +1045,9 @@ def init_session():
 def reset_experiment():
     for key in list(st.session_state.keys()):
         if key in {
+            "final_saved",
+            "google_uploaded",
+            "google_upload_error",
             "stage", "workbook_path", "participant_meta", "exp_meta", "experiment_sequence", "experiment_index",
             "trials", "practice_trials",
             "current_index", "current_render_id", "trial_start_ts", "exp_start_ts", "responses",
@@ -1356,7 +1407,8 @@ def render_trial(trials: list, mode: str):
         try:
             img_path = resolve_image_path(trial["image_path"])
             st.session_state["resolved_image_path"] = str(img_path)
-            st.image(Image.open(img_path).convert("RGB"), use_container_width=True)
+            img_bytes = load_image_bytes(str(img_path))
+            st.image(img_bytes, use_container_width=True)
             if st.session_state.get("show_debug"):
                 st.caption(f"图片路径：{img_path}")
         except Exception as e:
@@ -1475,7 +1527,9 @@ def render_trial(trials: list, mode: str):
 
                 if mode != "practice":
                     st.session_state["responses"].append(record)
-                    save_progress()
+                    # 只在每个实验结束时保存一次，避免每题写 Excel 导致卡顿
+                    if idx + 1 >= total:
+                        save_progress()
                     st.session_state["current_index"] += 1
                     st.session_state["current_render_id"] = None
                     st.session_state["trial_phase"] = "initial"
@@ -1500,60 +1554,84 @@ def render_questionnaire():
     st.markdown("你已完成三个实验。请根据整个实验过程中的真实感受作答，没有对错之分。")
 
     with st.form("questionnaire_form"):
-        st.markdown("### 第一部分：对 AI 系统的整体评价")
-        understanding = st.slider("1. 我能够理解 AI 给出该判断建议的依据。", 1, 7, 4)
-        trust = st.slider("2. 我认为该 AI 系统的建议总体上值得信任。", 1, 7, 4)
-        reliance = st.slider("3. 在做最终判断时，我在多大程度上参考了 AI 的建议？", 1, 7, 4)
-        ai_helpfulness = st.slider("4. AI 的建议对我完成任务有帮助。", 1, 7, 4)
+        st.markdown("### 第一部分：AI 信任量表")
+        st.caption("1=非常不同意，7=非常同意")
+        stias_confidence = st.slider("1. 我对该 AI 系统有信心。", 1, 7, 4)
+        stias_reliable = st.slider("2. 该 AI 系统是可靠的。", 1, 7, 4)
+        stias_trust = st.slider("3. 我可以信任该 AI 系统。", 1, 7, 4)
 
-        st.markdown("### 第二部分：认知负荷评估（NASA-TLX）")
-        nasa_mental = st.slider("5. 脑力需求：完成任务需要多少脑力投入？", 0, 100, 50)
-        nasa_temporal = st.slider("6. 时间压力：你感受到多大的时间压力？", 0, 100, 50)
-        nasa_effort = st.slider("7. 努力程度：你需要付出多少努力来完成任务？", 0, 100, 50)
-        nasa_frustration = st.slider("8. 挫败感：你在任务中感到多少挫败、烦躁或压力？", 0, 100, 50)
-        nasa_performance = st.slider("9. 你对自己在任务中表现的满意程度如何？", 0, 100, 50)
+        st.markdown("### 第二部分：解释满意度量表")
+        st.caption("请根据你在实验二和实验三中看到 AI 解释时的整体感受作答。1=非常不同意，5=非常同意")
+        ess_understand = st.slider("4. AI 的解释让我能够理解其判断依据。", 1, 5, 3)
+        ess_satisfy = st.slider("5. 总体来说，我对 AI 提供的解释感到满意。", 1, 5, 3)
+        ess_detail = st.slider("6. AI 的解释提供了足够的细节。", 1, 5, 3)
+        ess_complete = st.slider("7. AI 的解释覆盖了我作出判断所需的主要信息。", 1, 5, 3)
+        ess_useful = st.slider("8. AI 的解释对我完成判断任务是有帮助的。", 1, 5, 3)
+        ess_accuracy = st.slider("9. AI 的解释看起来与图像或产品信息相符合。", 1, 5, 3)
+        ess_trust = st.slider("10. AI 的解释让我更愿意相信 AI 的建议。", 1, 5, 3)
 
-        st.markdown("### 第三部分：质检判断策略")
+        st.markdown("### 第三部分：任务负荷量表（NASA-TLX）")
+        st.caption("0=非常低，100=非常高。表现维度中，0=非常成功，100=非常失败。")
+        nasa_mental = st.slider("11. 脑力需求：完成任务需要多少脑力投入？", 0, 100, 50)
+        nasa_physical = st.slider("12. 体力需求：完成任务需要多少身体操作负担？", 0, 100, 10)
+        nasa_temporal = st.slider("13. 时间压力：你感受到多大的时间压力？", 0, 100, 50)
+        nasa_performance = st.slider("14. 任务表现：你认为自己完成任务的成功程度如何？", 0, 100, 50)
+        nasa_effort = st.slider("15. 努力程度：你需要付出多少努力来完成任务？", 0, 100, 50)
+        nasa_frustration = st.slider("16. 挫败感：你在任务中感到多少挫败、烦躁或压力？", 0, 100, 50)
+
+        st.markdown("### 第四部分：任务策略补充")
         quality_strategy = st.radio(
-            "10. 在实验一和实验二的质检判断中，你通常的策略是？",
+            "17. 在实验一和实验二的质检判断中，你通常的策略是？",
             ["主要依靠自己的图像判断", "图像判断和AI建议各参考一半", "主要参考AI建议", "视情况而定"],
             index=3,
         )
         quality_changed_reason = st.radio(
-            "11. 在质检判断中，当你改变了初步判断时，主要原因是？",
+            "18. 在质检判断中，当你改变了初步判断时，主要原因是？",
             ["AI建议与我不同，选择相信AI", "AI的解释让我重新审视图像", "不确定时偏向跟随AI", "我没有改变过判断"],
             index=3,
         )
-
-        st.markdown("### 第四部分：多目标采购判断策略")
         purchase_strategy = st.radio(
-            "12. 在实验三的采购判断中，你通常更偏向哪种策略？",
+            "19. 在实验三的采购判断中，你通常更偏向哪种策略？",
             ["主要看质量，再兼顾成本", "质量与成本大致各占一半", "主要看成本，只要质量别太差", "视情况而定"],
             index=1,
         )
         purchase_changed_reason = st.radio(
-            "13. 在采购判断中，当你改变了初步判断时，主要原因是？",
+            "20. 在采购判断中，当你改变了初步判断时，主要原因是？",
             ["AI建议与我不同，选择相信AI", "看到质量信息后改变了判断", "看到价格后改变了判断", "我没有改变过判断"],
             index=3,
         )
-        quality_priority = st.slider("14. 在采购判断中，你认为质量信息的重要性有多高？", 1, 7, 5)
-        cost_priority = st.slider("15. 在采购判断中，你认为价格信息的重要性有多高？", 1, 7, 4)
-        rule_awareness = st.slider("16. 你是否感觉系统内部存在某种固定的采购判断规则？", 1, 7, 5)
+        quality_priority = st.slider("21. 在采购判断中，你认为质量信息的重要性有多高？", 1, 7, 5)
+        cost_priority = st.slider("22. 在采购判断中，你认为价格信息的重要性有多高？", 1, 7, 4)
+        rule_awareness = st.slider("23. 你是否感觉系统内部存在某种固定的采购判断规则？", 1, 7, 5)
 
-        comments = st.text_area("17. 如有其他想说的（例如：哪些题目较难、对实验的建议等），请在此填写：", placeholder="选填")
+        comments = st.text_area("24. 如有其他想说的（例如：哪些题目较难、对实验的建议等），请在此填写：", placeholder="选填")
         submitted = st.form_submit_button("提交问卷", type="primary", use_container_width=True)
 
     if submitted:
+        stias_items = [stias_confidence, stias_reliable, stias_trust]
+        ess_items = [ess_understand, ess_satisfy, ess_detail, ess_complete, ess_useful, ess_accuracy, ess_trust]
+        nasa_items = [nasa_mental, nasa_physical, nasa_temporal, nasa_performance, nasa_effort, nasa_frustration]
         st.session_state["questionnaire"] = {
-            "understanding": understanding,
-            "trust": trust,
-            "reliance": reliance,
-            "ai_helpfulness": ai_helpfulness,
+            "scale_version": "S_TIAS_ESS_NASA_TLX_2026",
+            "stias_confidence": stias_confidence,
+            "stias_reliable": stias_reliable,
+            "stias_trust": stias_trust,
+            "stias_mean": round(sum(stias_items) / len(stias_items), 3),
+            "ess_understand": ess_understand,
+            "ess_satisfaction": ess_satisfy,
+            "ess_detail": ess_detail,
+            "ess_complete": ess_complete,
+            "ess_useful": ess_useful,
+            "ess_accuracy": ess_accuracy,
+            "ess_trust": ess_trust,
+            "ess_mean": round(sum(ess_items) / len(ess_items), 3),
             "nasa_mental": nasa_mental,
+            "nasa_physical": nasa_physical,
             "nasa_temporal": nasa_temporal,
+            "nasa_performance": nasa_performance,
             "nasa_effort": nasa_effort,
             "nasa_frustration": nasa_frustration,
-            "nasa_performance": nasa_performance,
+            "nasa_raw_mean": round(sum(nasa_items) / len(nasa_items), 3),
             "quality_strategy": map_strategy_code(quality_strategy),
             "quality_changed_reason": map_changed_reason_code(quality_changed_reason),
             "purchase_strategy": map_strategy_code(purchase_strategy),
@@ -1625,6 +1703,11 @@ def get_or_create_worksheet(spreadsheet, sheet_name: str, headers: list):
     existing_headers = worksheet.row_values(1)
     if not existing_headers:
         worksheet.update("A1", [headers])
+    else:
+        missing_headers = [h for h in headers if h not in existing_headers]
+        if missing_headers:
+            updated_headers = existing_headers + missing_headers
+            worksheet.update("A1", [updated_headers])
     return worksheet
 
 
@@ -1633,7 +1716,13 @@ def append_df_to_google_sheet(spreadsheet, sheet_name: str, df: pd.DataFrame):
         return
     headers = [str(c) for c in df.columns]
     worksheet = get_or_create_worksheet(spreadsheet, sheet_name, headers)
-    values = dataframe_to_sheet_values(df)
+    sheet_headers = worksheet.row_values(1) or headers
+    safe_df = df.copy()
+    for header in sheet_headers:
+        if header not in safe_df.columns:
+            safe_df[header] = ""
+    safe_df = safe_df[sheet_headers]
+    values = dataframe_to_sheet_values(safe_df)
     if values:
         worksheet.append_rows(values, value_input_option="USER_ENTERED")
 
@@ -1667,20 +1756,35 @@ def upload_current_result_to_google_sheets() -> tuple[bool, str]:
 
 def render_finish():
     st.title("🎉 实验完成")
-    st.success("感谢你的参与，三个实验的数据已自动保存。")
+    st.success("感谢你的参与，三个实验已经全部完成。")
     participant_id = st.session_state["participant_meta"].get("participant_id", "unknown")
     out_dir = ensure_results_dir(participant_id)
-    save_progress()
-
-    uploaded, upload_message = upload_current_result_to_google_sheets()
-    if uploaded:
-        st.success(upload_message)
+    # 关键：避免页面刷新导致重复保存/重复上传
+    if "final_saved" not in st.session_state:
+        st.session_state["final_saved"] = False
+    if "google_uploaded" not in st.session_state:
+        st.session_state["google_uploaded"] = False
+    if "google_upload_error" not in st.session_state:
+        st.session_state["google_upload_error"] = ""
+    # 只在第一次进入完成页时保存本地 Excel
+    if not st.session_state["final_saved"]:
+        save_progress()
+        st.session_state["final_saved"] = True
+    # 只在第一次进入完成页时上传 Google Sheet
+    if not st.session_state["google_uploaded"]:
+        try:
+            upload_to_google_sheet()
+            st.session_state["google_uploaded"] = True
+            st.session_state["google_upload_error"] = ""
+        except Exception as e:
+            st.session_state["google_upload_error"] = str(e)
+    if st.session_state["google_uploaded"]:
+        st.success("数据已成功上传至 Google Sheet。")
     else:
-        st.warning(upload_message)
-
-    st.markdown("研究者可在以下位置找到保存文件：")
-    st.code(str(out_dir / OUTPUT_XLSX_NAME), language="text")
-    st.info("如果你使用的是线上 Streamlit 链接，上面的路径是云端服务器路径，不是本机 D 盘路径。请点击下面按钮下载实验数据。")
+        st.warning("Google Sheet 自动上传失败。请点击下方按钮下载 Excel，并发送给研究者。")
+        st.caption(st.session_state["google_upload_error"])
+    st.markdown("### 数据备份")
+    st.info("为避免网络波动导致数据丢失，请下载本次实验数据作为备份。")
     st.download_button(
         "⬇️ 下载本次实验数据（Excel）",
         data=build_result_workbook_bytes(),
